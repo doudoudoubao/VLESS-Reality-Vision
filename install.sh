@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 #=============================== 常量 ==================================#
 
-readonly SCRIPT_VERSION='1.0.0'
+readonly SCRIPT_VERSION='1.1.0'
 readonly SCRIPT_NAME='VLESS + Reality + Vision 一键脚本'
 readonly REPO_RAW='https://raw.githubusercontent.com/doudoudoubao/VLESS-Reality-Vision/main/install.sh'
 readonly XRAY_INSTALLER='https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh'
@@ -32,6 +32,8 @@ readonly META_FILE="${DATA_DIR}/meta.conf"
 readonly USERS_FILE="${DATA_DIR}/users.tsv"
 readonly BACKUP_DIR="${DATA_DIR}/backup"
 readonly CMD_PATH='/usr/local/bin/reality'
+readonly UPDATE_SERVICE='/etc/systemd/system/reality-update.service'
+readonly UPDATE_TIMER='/etc/systemd/system/reality-update.timer'
 
 # 备选偷取目标：逐个实测支持 TLS1.3 + HTTP/2，未套 Cloudflare，
 # 且不属于 Xray-core 官方点名警告的 apple / icloud 系域名。
@@ -1082,15 +1084,130 @@ cmd_rules() {
   ok '路由规则已更新。'
 }
 
+xray_version() { "$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}'; }
+
+# 官方脚本在「已是最新」时只打印一行提示并 exit 0，不会改动任何文件，
+# 因此本命令可以安全地反复执行（定时任务正是依赖这一点）。
 cmd_update() {
   detect_os
-  install_xray_core
-  if is_installed && load_meta; then
-    apply_config && ok 'Xray 已更新并重新载入配置。'
-  else
-    ok 'Xray 已更新。'
+  local backup='' old_ver='' new_ver=''
+
+  if [[ -x $XRAY_BIN ]]; then
+    old_ver=$(xray_version)
+    install -d -m 700 "$DATA_DIR"
+    backup="${DATA_DIR}/xray.prev"
+    cp -a "$XRAY_BIN" "$backup" 2>/dev/null || backup=''
   fi
-  info "当前版本：$("$XRAY_BIN" version 2>/dev/null | head -n1)"
+
+  install_xray_core
+  new_ver=$(xray_version)
+
+  if [[ -n $old_ver && $old_ver == "$new_ver" ]]; then
+    ok "已是最新版本：${new_ver}"
+    return 0
+  fi
+
+  if is_installed && load_meta; then
+    if apply_config; then
+      ok "Xray 已从 ${old_ver:-未知} 更新到 ${new_ver}，配置已重新载入。"
+    else
+      # 新版本起不来时退回上一版二进制，避免无人值守更新把代理搞挂
+      if [[ -n $backup && -s $backup ]]; then
+        warn "新版本（${new_ver:-版本号未知}）启动失败，正在回滚到 ${old_ver}…"
+        install -m 755 "$backup" "$XRAY_BIN"
+        systemctl restart xray >/dev/null 2>&1 || true
+        sleep 1
+        if systemctl is-active --quiet xray; then
+          ok "已回滚到 ${old_ver} 并恢复运行。"
+        else
+          error '回滚后服务仍未运行，请执行 reality log 查看原因。'
+        fi
+      fi
+      return 1
+    fi
+  else
+    ok "Xray 已更新到 ${new_ver}。"
+  fi
+}
+
+cmd_autoupdate() {
+  local action=${ARG1:-status}
+  case $action in
+    on|enable)
+      [[ -x $CMD_PATH ]] || die "未找到 ${CMD_PATH}，请先完成安装。"
+      cat >"$UPDATE_SERVICE" <<EOF
+[Unit]
+Description=Reality 自动更新 Xray-core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CMD_PATH} update --yes
+EOF
+      # RandomizedDelaySec 把请求打散，避免所有机器同一分钟去打 GitHub API
+      cat >"$UPDATE_TIMER" <<'EOF'
+[Unit]
+Description=每天检查一次 Xray-core 更新
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=4h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+      chmod 644 "$UPDATE_SERVICE" "$UPDATE_TIMER"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable --now reality-update.timer >/dev/null 2>&1 ||
+        die '定时器启用失败。'
+      ok '已开启自动更新：每天检查一次，随机延迟 0-4 小时。'
+      info '更新失败或新版本起不来时会自动回滚到上一版本。'
+      cmd_autoupdate_status
+      ;;
+    off|disable)
+      systemctl disable --now reality-update.timer >/dev/null 2>&1 || true
+      rm -f "$UPDATE_SERVICE" "$UPDATE_TIMER"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ok '已关闭自动更新。'
+      ;;
+    status) cmd_autoupdate_status ;;
+    *) die "用法：reality autoupdate <on|off|status>" ;;
+  esac
+}
+
+cmd_autoupdate_status() {
+  if [[ -f $UPDATE_TIMER ]] && systemctl is-enabled --quiet reality-update.timer 2>/dev/null; then
+    printf '自动更新：%s已开启%s\n' "$C_GREEN" "$C_OFF"
+    systemctl list-timers reality-update.timer --no-pager 2>/dev/null | head -n2 || true
+  else
+    printf '自动更新：%s未开启%s（执行 reality autoupdate on 开启）\n' "$C_YELLOW" "$C_OFF"
+  fi
+  return 0
+}
+
+# 更新管理脚本自身。刻意只提供手动方式：让服务器无人值守地自动执行
+# 来自网络的新代码，风险远大于收益。
+cmd_selfupdate() {
+  local tmp new_ver
+  tmp=$(mktemp "${TMPDIR:-/tmp}/reality.XXXXXX.sh") || return 1
+  info '下载最新版管理脚本…'
+  if ! curl -fsSL --retry 3 --max-time 60 -o "$tmp" "$REPO_RAW"; then
+    rm -f "$tmp"; die "下载失败：${REPO_RAW}"
+  fi
+  if ! head -n1 "$tmp" | grep -q '^#!' || ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; die '下载到的脚本未通过语法检查，已放弃更新。'
+  fi
+  new_ver=$(grep -m1 "^readonly SCRIPT_VERSION=" "$tmp" | cut -d"'" -f2)
+  if [[ $new_ver == "$SCRIPT_VERSION" ]]; then
+    rm -f "$tmp"
+    ok "已是最新版本：v${SCRIPT_VERSION}"
+    return 0
+  fi
+  install -m 755 "$tmp" "$CMD_PATH"
+  rm -f "$tmp"
+  ok "管理脚本已从 v${SCRIPT_VERSION} 更新到 v${new_ver:-未知}"
 }
 
 cmd_restart() { systemctl restart xray && ok 'Xray 已重启。'; }
@@ -1153,6 +1270,10 @@ cmd_uninstall() {
     manual_remove_xray
   fi
 
+  systemctl disable --now reality-update.timer >/dev/null 2>&1 || true
+  rm -f "$UPDATE_SERVICE" "$UPDATE_TIMER"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   [[ -n $port ]] && firewall_revoke "$port"
   rm -rf "$DATA_DIR" "$XRAY_CONF_DIR"
   rm -f "$CMD_PATH" /etc/sysctl.d/99-reality-bbr.conf
@@ -1195,10 +1316,32 @@ show_menu() {
   printf ' %s12%s) 服务管理（启动 / 停止 / 重启 / 状态）\n' "$C_GREEN" "$C_OFF"
   printf ' %s13%s) 查看实时日志\n'               "$C_GREEN" "$C_OFF"
   printf ' %s14%s) 更新 Xray-core\n'             "$C_GREEN" "$C_OFF"
-  printf ' %s15%s) 开启 BBR 加速\n'              "$C_GREEN" "$C_OFF"
-  printf ' %s16%s) 卸载\n'                       "$C_RED"   "$C_OFF"
+  printf ' %s15%s) 自动更新开关（当前：%s）\n'   "$C_GREEN" "$C_OFF" "$(autoupdate_state)"
+  printf ' %s16%s) 开启 BBR 加速\n'              "$C_GREEN" "$C_OFF"
+  printf ' %s17%s) 卸载\n'                       "$C_RED"   "$C_OFF"
   printf '  %s0%s) 退出\n'                       "$C_GREEN" "$C_OFF"
   hr
+}
+
+autoupdate_enabled() {
+  [[ -f $UPDATE_TIMER ]] && systemctl is-enabled --quiet reality-update.timer 2>/dev/null
+}
+
+autoupdate_state() {
+  if autoupdate_enabled; then printf '%s已开启%s' "$C_GREEN" "$C_OFF"
+  else printf '未开启'; fi
+}
+
+autoupdate_toggle() {
+  if autoupdate_enabled; then
+    cmd_autoupdate_status
+    confirm '要关闭自动更新吗？' 'n' && ARG1='off' || return 0
+  else
+    printf '开启后每天检查一次官方最新版（随机延迟 0-4 小时），\n'
+    printf '新版本启动失败会自动回滚到上一版本。\n'
+    confirm '要开启自动更新吗？' 'y' && ARG1='on' || return 0
+  fi
+  cmd_autoupdate
 }
 
 service_submenu() {
@@ -1234,8 +1377,9 @@ menu_loop() {
       12) service_submenu || error '操作失败。' ;;
       13) cmd_log         || error '操作失败。' ;;
       14) cmd_update      || error '操作失败。' ;;
-      15) cmd_bbr         || error '操作失败。' ;;
-      16) cmd_uninstall   || error '操作失败。'
+      15) autoupdate_toggle || error '操作失败。' ;;
+      16) cmd_bbr         || error '操作失败。' ;;
+      17) cmd_uninstall   || error '操作失败。'
           is_installed    || exit 0 ;;
       0)  exit 0 ;;
       *)  warn '无效选项。' ;;
@@ -1267,7 +1411,11 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   change-uuid             重新生成全部 UUID
   rekey                   重新生成 Reality 密钥对
   rules                   调整路由拦截规则
-  update                  更新 Xray-core
+  update                  立即检查并更新 Xray-core（已是最新则不改动任何文件）
+  autoupdate <on|off|status>
+                          自动更新开关：每天检查一次官方最新版，
+                          新版本起不来会自动回滚到上一版本
+  selfupdate              更新管理脚本自身（仅手动）
   start | stop | restart | status | log
   bbr                     开启 BBR 加速
   uninstall               卸载
@@ -1295,7 +1443,7 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
 EOF
 }
 
-ACTION='menu'
+ACTION='menu'; ARG1=''
 OPT_PORT=''; OPT_SNI=''; OPT_DEST=''; OPT_UUID=''; OPT_NAME=''; OPT_HOST=''
 OPT_FORCE=0; OPT_YES=0
 
@@ -1312,7 +1460,10 @@ parse_args() {
       --force)   OPT_FORCE=1; shift ;;
       -y|--yes)  OPT_YES=1;   shift ;;
       -h|--help) usage; exit 0 ;;
-      *) die "未知选项：$1（执行 reality help 查看帮助）" ;;
+      -*) die "未知选项：$1（执行 reality help 查看帮助）" ;;
+      *) # 子命令的位置参数，如 autoupdate on
+         [[ -z $ARG1 ]] || die "多余的参数：$1"
+         ARG1=$1; shift ;;
     esac
   done
 }
@@ -1334,6 +1485,8 @@ dispatch() {
     rekey)            cmd_rekey ;;
     rules)            cmd_rules ;;
     update)           cmd_update ;;
+    autoupdate)       cmd_autoupdate ;;
+    selfupdate)       cmd_selfupdate ;;
     restart)          cmd_restart ;;
     start)            cmd_start ;;
     stop)             cmd_stop ;;

@@ -47,7 +47,8 @@ reality install --port 443 --sni www.nvidia.com --name hk --host 1.2.3.4 --yes
 | 配置安全网 | 每次改动先做 `xray -test` 自检，失败不落盘；启动异常自动回滚上一份配置 |
 | 目标可用性检测 | 选 SNI 时实测目标是否支持 TLS1.3 + HTTP/2，不合格当场提示 |
 | 客户端导出 | 分享链接、二维码、sing-box 出站、Clash.Meta 节点片段 |
-| 其它 | BBR 加速、路由拦截规则、实时日志、内核更新、干净卸载 |
+| 跟随官方更新 | 每次更新都现拉官方安装脚本装最新内核，可开启每日自动更新，新版本起不来会自动回滚 |
+| 其它 | BBR 加速、路由拦截规则、实时日志、干净卸载 |
 
 ## 命令一览
 
@@ -65,7 +66,9 @@ reality change-host     修改分享地址   reality change-uuid   重建全部 
 reality rekey           轮换 Reality 密钥对
 reality rules           调整路由拦截规则
 
-reality update          更新 Xray-core
+reality update          立即检查并更新 Xray-core
+reality autoupdate on|off|status    自动更新开关
+reality selfupdate      更新管理脚本自身
 reality start | stop | restart | status | log
 reality bbr             开启 BBR 加速
 reality uninstall       卸载
@@ -137,6 +140,43 @@ reality uninstall       卸载
 **BT 流量默认拦截。** 多数 VPS 商家禁止 BT/PT，一次滥用就可能导致停机。可在
 `reality rules` 中关闭。
 
+## 跟随官方更新
+
+脚本**不内置任何 Xray 副本**：每次执行 `reality update`，都会现从
+[XTLS/Xray-install](https://github.com/XTLS/Xray-install) 官方仓库拉取最新的
+`install-release.sh`，再由它安装官方最新版内核。所以脚本本身不会因为放久了而过期。
+
+官方安装脚本在检测到「已是最新版本」时，只打印一行提示就退出，**不会改动任何文件**，
+因此重复执行是幂等且安全的 —— 定时任务正是依赖这一点。
+
+### 开启每日自动更新
+
+```bash
+reality autoupdate on       # 开启
+reality autoupdate status   # 查看状态与下次执行时间
+reality autoupdate off      # 关闭
+```
+
+开启后会注册一个 systemd timer，每天检查一次，并带 0–4 小时的随机延迟
+（避免所有机器同一分钟去打 GitHub API）。若机器当时关机，下次开机会补跑。
+
+**自动更新的安全保障**：更新前先备份当前二进制，更新后如果配置自检不通过、
+或服务起不来，会自动**回滚到上一版本的二进制**并重启，确保代理不会在无人值守时挂掉。
+
+> 说明：「实时更新」在技术上做不到 —— GitHub 不会主动推送到你的服务器，只能轮询；
+> 而官方安装脚本走的是未认证的 GitHub API，按 IP 限流，分钟级轮询没有意义。
+> 每天一次已经足够及时。
+
+### 更新脚本自身
+
+```bash
+reality selfupdate
+```
+
+会从本仓库拉取最新的 `install.sh`，**先做语法检查再替换**，版本相同则不动。
+这一项**刻意只提供手动方式**：让服务器无人值守地自动执行来自网络的新代码，
+风险远大于收益。
+
 ## 关于握手目标（SNI）的选择
 
 Reality 的原理是让你的服务器在被主动探测时，表现得像是在访问某个真实网站。
@@ -166,8 +206,10 @@ www.lovelive-anime.jp             shopping.yahoo.co.jp
 /usr/local/etc/xray/reality/meta.conf      节点参数（600 root）
 /usr/local/etc/xray/reality/users.tsv      用户列表（600 root）
 /usr/local/etc/xray/reality/backup/        配置备份（最近 10 份）
+/usr/local/etc/xray/reality/xray.prev      上一版本二进制（供更新失败时回滚）
 /var/log/xray/error.log                    错误日志
 /etc/systemd/system/xray.service           systemd 服务（官方脚本生成）
+/etc/systemd/system/reality-update.timer   自动更新定时器（开启后才有）
 ```
 
 ## 常见问题
