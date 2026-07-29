@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 #=============================== 常量 ==================================#
 
-readonly SCRIPT_VERSION='1.1.0'
+readonly SCRIPT_VERSION='1.1.1'
 readonly SCRIPT_NAME='VLESS + Reality + Vision 一键脚本'
 readonly REPO_RAW='https://raw.githubusercontent.com/doudoudoubao/VLESS-Reality-Vision/main/install.sh'
 readonly XRAY_INSTALLER='https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh'
@@ -805,6 +805,7 @@ cmd_install() {
     fi
   fi
   valid_port "$PORT" || die "端口非法：${PORT}"
+  PORT=$((10#$PORT))   # 去掉前导零，否则写进 JSON 会变成非法数字
   warn_port_risk "$PORT"
 
   # ---- 偷取目标 ----
@@ -982,6 +983,7 @@ cmd_change_port() {
   new=$OPT_PORT
   [[ -n $new ]] || new=$(ask '新的监听端口' "$old")
   valid_port "$new" || die "端口非法：${new}"
+  new=$((10#$new))   # 去掉前导零，否则写进 JSON 会变成非法数字
   if [[ $new == "$old" ]]; then info '端口未变化。'; return 0; fi
   if port_in_use "$new"; then
     confirm "端口 ${new} 已被占用，仍要使用吗？" 'n' || return 1
@@ -1199,14 +1201,19 @@ cmd_selfupdate() {
     rm -f "$tmp"; die '下载到的脚本未通过语法检查，已放弃更新。'
   fi
   new_ver=$(grep -m1 "^readonly SCRIPT_VERSION=" "$tmp" | cut -d"'" -f2)
-  if [[ $new_ver == "$SCRIPT_VERSION" ]]; then
+  # 按内容而非版本号判断：修了 bug 却忘记改版本号时，也不会漏掉更新
+  if [[ -f $CMD_PATH ]] && cmp -s "$tmp" "$CMD_PATH"; then
     rm -f "$tmp"
     ok "已是最新版本：v${SCRIPT_VERSION}"
     return 0
   fi
   install -m 755 "$tmp" "$CMD_PATH"
   rm -f "$tmp"
-  ok "管理脚本已从 v${SCRIPT_VERSION} 更新到 v${new_ver:-未知}"
+  if [[ $new_ver == "$SCRIPT_VERSION" ]]; then
+    ok "管理脚本已更新到最新提交（版本号仍为 v${SCRIPT_VERSION}）"
+  else
+    ok "管理脚本已从 v${SCRIPT_VERSION} 更新到 v${new_ver:-未知}"
+  fi
 }
 
 cmd_restart() { systemctl restart xray && ok 'Xray 已重启。'; }
@@ -1499,8 +1506,27 @@ dispatch() {
   esac
 }
 
+# 把位置参数映射到对应选项，如 `reality change-port 8443`。
+# 不接受参数的命令必须报错——静默忽略会让敲错的命令看起来"执行成功"却什么都没做。
+apply_positional() {
+  [[ -n $ARG1 ]] || return 0
+  case $ACTION in
+    autoupdate) ;;  # 由 cmd_autoupdate 直接读取 ARG1
+    change-port|port)  [[ -n $OPT_PORT ]] || OPT_PORT=$ARG1 ;;
+    change-sni|sni)    [[ -n $OPT_SNI  ]] || OPT_SNI=$ARG1 ;;
+    change-host|host)  [[ -n $OPT_HOST ]] || OPT_HOST=$ARG1 ;;
+    add-user|adduser|del-user|deluser)
+                       [[ -n $OPT_NAME ]] || OPT_NAME=$ARG1 ;;
+    install)
+      die "install 需要用具体选项，例如：reality install --port ${ARG1}（或 --sni / --name）" ;;
+    *) die "命令 ${ACTION} 不接受参数：${ARG1}" ;;
+  esac
+  return 0
+}
+
 main() {
   parse_args "$@"
+  apply_positional
 
   case $ACTION in
     help|version|-v|--version) ;;
