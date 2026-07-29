@@ -798,7 +798,6 @@ cmd_install() {
         if port_in_use "$PORT"; then
           confirm "端口 ${PORT} 已被占用，仍要使用吗？" 'n' || continue
         fi
-        warn_port_risk "$PORT"
         break
       done
     else
