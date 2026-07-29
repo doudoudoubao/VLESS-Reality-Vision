@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 #=============================== 常量 ==================================#
 
-readonly SCRIPT_VERSION='1.1.1'
+readonly SCRIPT_VERSION='1.2.0'
 readonly SCRIPT_NAME='VLESS + Reality + Vision 一键脚本'
 readonly REPO_RAW='https://raw.githubusercontent.com/doudoudoubao/VLESS-Reality-Vision/main/install.sh'
 readonly XRAY_INSTALLER='https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh'
@@ -55,16 +55,95 @@ readonly DEST_CANDIDATES=(
 if [[ -t 1 ]]; then
   C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[0;33m'
   C_BLUE=$'\033[0;36m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+  C_CYAN=$'\033[1;36m'; C_GRAY=$'\033[0;90m'
 else
   C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_BOLD=''; C_OFF=''
+  C_CYAN=''; C_GRAY=''
 fi
+
+# 界面本身就是中文，终端不支持 UTF-8 的话中文早就乱码了，
+# 因此默认直接用制表符；仅在 REALITY_ASCII=1 时退回纯 ASCII。
+if [[ ${REALITY_ASCII:-0} == '1' ]]; then
+  GL_H='-'; GL_TL='+'; GL_BL='+'; GL_DOT='-'; GL_ON='*'; GL_OFF='o'
+else
+  GL_H='─'; GL_TL='╭'; GL_BL='╰'; GL_DOT='·'; GL_ON='●'; GL_OFF='○'
+fi
+readonly UI_WIDTH=62
 
 info() { printf '%s[信息]%s %s\n' "$C_BLUE" "$C_OFF" "$*"; }
 ok()   { printf '%s[成功]%s %s\n' "$C_GREEN" "$C_OFF" "$*"; }
 warn() { printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_OFF" "$*" >&2; }
 error(){ printf '%s[错误]%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
 die()  { error "$*"; exit 1; }
-hr()   { printf '%s\n' '----------------------------------------------------------------'; }
+
+repeat_char() { # repeat_char <字符> <次数>
+  local i; for ((i = 0; i < $2; i++)); do printf '%s' "$1"; done
+}
+
+hr() { printf '%s' "$C_GRAY"; repeat_char "$GL_H" "$UI_WIDTH"; printf '%s\n' "$C_OFF"; }
+
+# 计算显示宽度：中文/全角按 2 列，其余按 1 列。
+# 在 LC_ALL=C 下逐字节解析 UTF-8，不依赖终端 locale 是否正确设置。
+disp_width() {
+  local LC_ALL=C s=${1-} i=0 w=0 n b1 b2 b3 cp
+  n=${#s}
+  while ((i < n)); do
+    b1=$(( $(printf '%d' "'${s:i:1}") & 255 ))
+    if ((b1 < 0x80)); then
+      ((w += 1, i += 1))
+    elif ((b1 < 0xE0)); then
+      ((w += 1, i += 2))
+    elif ((b1 < 0xF0)); then
+      b2=$(( $(printf '%d' "'${s:i+1:1}") & 255 ))
+      b3=$(( $(printf '%d' "'${s:i+2:1}") & 255 ))
+      cp=$(( (b1 & 0x0F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F) ))
+      # CJK、假名、谚文与全角标点为双宽；框线、箭头等符号仍是单宽
+      if (( (cp >= 0x1100 && cp <= 0x115F) \
+         || (cp >= 0x2E80 && cp <= 0xA4CF && cp != 0x303F) \
+         || (cp >= 0xAC00 && cp <= 0xD7A3) \
+         || (cp >= 0xF900 && cp <= 0xFAFF) \
+         || (cp >= 0xFE30 && cp <= 0xFE6F) \
+         || (cp >= 0xFF00 && cp <= 0xFF60) \
+         || (cp >= 0xFFE0 && cp <= 0xFFE6) )); then
+        ((w += 2))
+      else
+        ((w += 1))
+      fi
+      ((i += 3))
+    else
+      ((w += 2, i += 4))
+    fi
+  done
+  printf '%d' "$w"
+}
+
+pad_to() { # pad_to <字符串> <目标显示宽度>
+  local s=${1-} w
+  w=$(disp_width "$s")
+  printf '%s' "$s"
+  while ((w < $2)); do printf ' '; ((w++)); done
+}
+
+# 标题栏：╭─ 标题 ─────…
+rule_top() {
+  local title=$1 used
+  used=$(disp_width "$title")
+  printf '%s%s%s %s%s%s ' "$C_GRAY" "$GL_TL" "$GL_H" "$C_OFF$C_BOLD" "$title" "$C_OFF$C_GRAY"
+  repeat_char "$GL_H" "$(( UI_WIDTH - used - 4 > 0 ? UI_WIDTH - used - 4 : 0 ))"
+  printf '%s\n' "$C_OFF"
+}
+
+rule_bottom() {
+  printf '%s%s' "$C_GRAY" "$GL_BL"; repeat_char "$GL_H" "$((UI_WIDTH - 1))"
+  printf '%s\n' "$C_OFF"
+}
+
+section() { printf '\n  %s%s%s\n' "$C_BOLD" "$1" "$C_OFF"; }
+
+field() { # field <标签> <值> [值的颜色]
+  printf '    %s%s%s  %s%s%s\n' \
+    "$C_GRAY" "$(pad_to "$1" 12)" "$C_OFF" "${3:-}" "$2" "${3:+$C_OFF}"
+}
 
 trap 'error "脚本在第 ${LINENO} 行意外中止（退出码 $?）"' ERR
 
@@ -677,24 +756,58 @@ print_clash() { # print_clash <uuid> <label>
 EOF
 }
 
+# 链接单独占一行且顶格输出，方便整行选中复制
+print_link() { # print_link <链接>
+  printf '\n  %s分享链接%s %s%s 整行复制即可导入客户端%s\n\n' \
+    "$C_BOLD" "$C_OFF" "$C_GRAY" "$GL_DOT" "$C_OFF"
+  printf '%s%s%s\n' "$C_CYAN" "$1" "$C_OFF"
+}
+
 show_node() { # show_node <uuid> <label> [--qr]
   local link; link=$(share_link "$1" "$2")
-  hr
-  printf ' %s节点：%s%s\n' "$C_BOLD" "$2" "$C_OFF"
-  hr
-  printf '  地址 (address)   : %s\n' "$(link_host)"
-  printf '  端口 (port)      : %s\n' "$PORT"
-  printf '  用户 ID (uuid)   : %s\n' "$1"
-  printf '  流控 (flow)      : xtls-rprx-vision\n'
-  printf '  传输 (network)   : tcp\n'
-  printf '  安全 (security)  : reality\n'
-  printf '  域名 (sni)       : %s\n' "$SNI"
-  printf '  公钥 (publicKey) : %s\n' "$PUBLIC_KEY"
-  printf '  短 ID (shortId)  : %s\n' "$(first_shortid)"
-  printf '  指纹 (fp)        : chrome\n'
-  hr
-  printf '%s分享链接：%s\n%s\n' "$C_GREEN" "$C_OFF" "$link"
+  printf '\n'
+  rule_top "节点 ${2}"
+  section '服务器'
+  field '地址'     "$(link_host)"    "$C_BOLD"
+  field '端口'     "$PORT"           "$C_BOLD"
+  field '用户 ID'  "$1"              "$C_BOLD"
+  section '伪装参数'
+  field 'SNI 域名' "$SNI"
+  field '公钥'     "$PUBLIC_KEY"
+  field 'Short ID' "$(first_shortid)"
+  field '指纹'     'chrome'
+  section '协议'
+  field '传输'     "tcp ${GL_DOT} reality"
+  field '流控'     'xtls-rprx-vision'
+  print_link "$link"
   [[ ${3:-} == '--qr' ]] && print_qr "$link"
+  rule_bottom
+  printf '\n'
+}
+
+# 多用户时共用参数只列一次，每个用户只显示各自的 UUID 与链接
+show_all_nodes() {
+  local uuid label idx=0
+  printf '\n'
+  rule_top '共用参数'
+  field '地址'     "$(link_host)"    "$C_BOLD"
+  field '端口'     "$PORT"           "$C_BOLD"
+  field 'SNI 域名' "$SNI"
+  field '公钥'     "$PUBLIC_KEY"
+  field 'Short ID' "$(first_shortid)"
+  field '指纹'     "chrome ${GL_DOT} tcp ${GL_DOT} reality ${GL_DOT} xtls-rprx-vision"
+  section '用户'
+  while IFS=$'\t' read -r uuid label || [[ -n ${uuid:-} ]]; do
+    [[ -n ${uuid:-} ]] || continue
+    ((idx++))
+    printf '\n    %s[%d]%s %s%s%s\n' "$C_GREEN" "$idx" "$C_OFF" "$C_BOLD" "${label:-user}" "$C_OFF"
+    printf '        %s%s%s\n' "$C_GRAY" "$uuid" "$C_OFF"
+    printf '%s%s%s\n' "$C_CYAN" "$(share_link "$uuid" "${label:-user}")" "$C_OFF"
+  done <"$USERS_FILE"
+  printf '\n'
+  printf '  %s链接可整行复制导入客户端；%sreality qr%s 可输出二维码%s\n' \
+    "$C_GRAY" "$C_OFF$C_GRAY$C_BOLD" "$C_OFF$C_GRAY" "$C_OFF"
+  rule_bottom
   printf '\n'
 }
 
@@ -866,22 +979,33 @@ cmd_install() {
 
 #============================== 管理命令 ==============================#
 
+status_line() {
+  local ver n
+  ver=$("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+  n=$(users_count)
+  printf '  '
+  if systemctl is-active --quiet xray; then
+    printf '%s%s 运行中%s' "$C_GREEN" "$GL_ON" "$C_OFF"
+  else
+    printf '%s%s 已停止%s' "$C_RED" "$GL_OFF" "$C_OFF"
+  fi
+  printf '%s   %s   Xray %s   %s   %s 个用户' \
+    "$C_GRAY" "$GL_DOT" "${ver:-未知}" "$GL_DOT" "$n"
+  if autoupdate_enabled; then printf '   %s   自动更新已开' "$GL_DOT"; fi
+  printf '%s\n' "$C_OFF"
+}
+
 cmd_info() {
   require_installed
-  local uuid label ver
-  ver=$("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
-  printf '\n%s服务状态：%s' "$C_BOLD" "$C_OFF"
-  if systemctl is-active --quiet xray; then
-    printf '%s运行中%s' "$C_GREEN" "$C_OFF"
+  printf '\n'
+  status_line
+  if (( $(users_count) > 1 )); then
+    show_all_nodes
   else
-    printf '%s已停止%s' "$C_RED" "$C_OFF"
+    local uuid label
+    IFS=$'\t' read -r uuid label <"$USERS_FILE" || true
+    show_node "${uuid:-}" "${label:-user}"
   fi
-  printf '    Xray 版本：%s\n' "${ver:-未知}"
-  printf '握手目标：%s    用户数：%s\n' "$DEST" "$(users_count)"
-  while IFS=$'\t' read -r uuid label || [[ -n ${uuid:-} ]]; do
-    [[ -n ${uuid:-} ]] || continue
-    show_node "$uuid" "${label:-user}"
-  done <"$USERS_FILE"
 }
 
 cmd_link() {
@@ -898,9 +1022,12 @@ cmd_qr() {
   local uuid label
   while IFS=$'\t' read -r uuid label || [[ -n ${uuid:-} ]]; do
     [[ -n ${uuid:-} ]] || continue
-    printf '\n%s%s%s\n' "$C_BOLD" "${label:-user}" "$C_OFF"
+    printf '\n'
+    rule_top "${label:-user}"
     print_qr "$(share_link "$uuid" "${label:-user}")"
+    rule_bottom
   done <"$USERS_FILE"
+  printf '\n'
 }
 
 cmd_client() {
@@ -909,12 +1036,15 @@ cmd_client() {
   IFS=$'\t' read -r uuid label <"$USERS_FILE" || true
   [[ -n ${uuid:-} ]] || die '没有可用用户。'
   label=${label:-user}
-  hr; printf ' %ssing-box 出站片段%s\n' "$C_BOLD" "$C_OFF"; hr
-  print_singbox "$uuid" "$label"
   printf '\n'
-  hr; printf ' %sClash.Meta / mihomo 节点片段%s\n' "$C_BOLD" "$C_OFF"; hr
-  print_clash "$uuid" "$label"
+  rule_top 'sing-box 出站片段'
+  printf '%s' "$C_CYAN"; print_singbox "$uuid" "$label"; printf '%s' "$C_OFF"
+  rule_bottom
   printf '\n'
+  rule_top 'Clash.Meta / mihomo 节点片段'
+  printf '%s' "$C_CYAN"; print_clash "$uuid" "$label"; printf '%s' "$C_OFF"
+  rule_bottom
+  printf '\n  %s以上片段可直接粘贴进对应客户端的配置文件%s\n\n' "$C_GRAY" "$C_OFF"
 }
 
 cmd_add_user() {
@@ -1288,45 +1418,46 @@ cmd_uninstall() {
 
 #=============================== 菜单 =================================#
 
+item() { # item <编号> <文字>：左列，按显示宽度补齐
+  printf '  %s%2s%s %s' "$C_GREEN" "$1" "$C_OFF" "$(pad_to "$2" 24)"
+}
+
+item_end() { # item_end <编号> <文字> [颜色]：行末项，不补空格
+  printf '  %s%2s%s %s\n' "${3:-$C_GREEN}" "$1" "$C_OFF" "$2"
+}
+
 show_menu() {
-  local state
+  printf '\n'
+  rule_top "$SCRIPT_NAME"
+  printf '  %sv%s%s\n' "$C_GRAY" "$SCRIPT_VERSION" "$C_OFF"
   if is_installed; then
-    if systemctl is-active --quiet xray; then
-      state="${C_GREEN}已安装 · 运行中${C_OFF}"
-    else
-      state="${C_RED}已安装 · 已停止${C_OFF}"
-    fi
+    status_line
   else
-    state="${C_YELLOW}未安装${C_OFF}"
+    printf '  %s%s 未安装%s%s   %s   选 1 开始安装%s\n' \
+      "$C_YELLOW" "$GL_OFF" "$C_OFF" "$C_GRAY" "$GL_DOT" "$C_OFF"
   fi
 
+  section '节点'
+  item  1 '安装 / 重装';       item_end  2 '查看节点与二维码'
+  item_end 3 '导出客户端配置'
+
+  section '用户'
+  item  4 '添加用户';          item_end  5 '删除用户'
+  item_end 6 '重新生成全部 UUID'
+
+  section '参数'
+  item  7 '修改监听端口';      item_end  8 '更换伪装域名 (SNI)'
+  item  9 '修改分享地址';      item_end 10 '更换 Reality 密钥'
+  item_end 11 '路由拦截规则'
+
+  section '维护'
+  item 12 '服务启停 / 状态';   item_end 13 '查看实时日志'
+  item 14 '更新 Xray-core';    item_end 15 "自动更新（$(autoupdate_state)）"
+  item 16 '开启 BBR 加速';     item_end 17 '卸载' "$C_RED"
+
   printf '\n'
-  hr
-  printf ' %s%s%s  v%s\n' "$C_BOLD" "$SCRIPT_NAME" "$C_OFF" "$SCRIPT_VERSION"
-  printf ' 状态：%s\n' "$state"
-  hr
-  printf '  %s1%s) 安装 / 重装\n'                "$C_GREEN" "$C_OFF"
-  printf '  %s2%s) 查看节点信息与二维码\n'       "$C_GREEN" "$C_OFF"
-  printf '  %s3%s) 导出 sing-box / Clash 配置\n' "$C_GREEN" "$C_OFF"
-  printf '\n'
-  printf '  %s4%s) 添加用户\n'                   "$C_GREEN" "$C_OFF"
-  printf '  %s5%s) 删除用户\n'                   "$C_GREEN" "$C_OFF"
-  printf '  %s6%s) 重新生成全部 UUID\n'          "$C_GREEN" "$C_OFF"
-  printf '\n'
-  printf '  %s7%s) 修改监听端口\n'               "$C_GREEN" "$C_OFF"
-  printf '  %s8%s) 更换偷取目标 (SNI)\n'         "$C_GREEN" "$C_OFF"
-  printf '  %s9%s) 修改分享地址（IP / 域名）\n'  "$C_GREEN" "$C_OFF"
-  printf ' %s10%s) 更换 Reality 密钥对\n'        "$C_GREEN" "$C_OFF"
-  printf ' %s11%s) 路由拦截规则\n'               "$C_GREEN" "$C_OFF"
-  printf '\n'
-  printf ' %s12%s) 服务管理（启动 / 停止 / 重启 / 状态）\n' "$C_GREEN" "$C_OFF"
-  printf ' %s13%s) 查看实时日志\n'               "$C_GREEN" "$C_OFF"
-  printf ' %s14%s) 更新 Xray-core\n'             "$C_GREEN" "$C_OFF"
-  printf ' %s15%s) 自动更新开关（当前：%s）\n'   "$C_GREEN" "$C_OFF" "$(autoupdate_state)"
-  printf ' %s16%s) 开启 BBR 加速\n'              "$C_GREEN" "$C_OFF"
-  printf ' %s17%s) 卸载\n'                       "$C_RED"   "$C_OFF"
-  printf '  %s0%s) 退出\n'                       "$C_GREEN" "$C_OFF"
-  hr
+  item_end 0 '退出'
+  rule_bottom
 }
 
 autoupdate_enabled() {
