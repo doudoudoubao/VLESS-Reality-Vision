@@ -222,9 +222,10 @@ www.lovelive-anime.jp             shopping.yahoo.co.jp
 2. 云服务器控制台的**安全组**是否放行了对应 TCP 端口（这是最常见的原因，
    脚本只能处理服务器内部的 ufw / firewalld，管不到云厂商的安全组）；
 3. 客户端的 SNI、公钥、短 ID、flow 是否与 `reality info` 输出完全一致；
-4. **客户端是否支持 Reality** —— 这一条最容易被忽略。
-   Quantumult X 与 Surge 不支持 VLESS，自然也用不了本节点；
-   iOS 上请用 Shadowrocket、Stash、sing-box 或较新版 Loon；
+4. **客户端是否支持 Reality** —— 需要同时支持 VLESS、Reality 和
+   `xtls-rprx-vision` 流控，缺一样都连不上。已实测可用的有
+   Shadowrocket 与 Quantumult X（较新版本）。判断方法：看客户端能否
+   填入「公钥 / Short ID / 指纹」这三个 Reality 专有字段，填不了就是不支持；
 5. `reality log` 看实时错误日志。
 
 时间未同步（`timedatectl` 显示 `NTP service: inactive`）**不会**导致连不上 ——
