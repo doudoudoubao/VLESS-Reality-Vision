@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 #=============================== 常量 ==================================#
 
-readonly SCRIPT_VERSION='1.2.0'
+readonly SCRIPT_VERSION='1.2.1'
 readonly SCRIPT_NAME='VLESS + Reality + Vision 一键脚本'
 readonly REPO_RAW='https://raw.githubusercontent.com/doudoudoubao/VLESS-Reality-Vision/main/install.sh'
 readonly XRAY_INSTALLER='https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh'
@@ -223,15 +223,19 @@ install_deps() {
   fi
 }
 
-# Reality 握手带时间戳，时间偏差过大会直接导致连不上
+# 本脚本未设置 maxTimeDiff（Xray 默认 0 = 不校验时间差），因此时钟偏差
+# 不会导致握手失败；但偏差过大会让 HTTPS 证书校验出错，影响后续更新下载。
 check_clock() {
   command -v timedatectl >/dev/null 2>&1 || return 0
   local synced
   synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo '')
   [[ $synced == 'yes' ]] && return 0
-  warn '系统时间未与 NTP 同步；Reality 对时间偏差敏感，正在尝试开启时间同步…'
-  timedatectl set-ntp true >/dev/null 2>&1 ||
-    warn '自动开启失败，请手动校时后再使用（否则可能握手失败）。'
+  warn '系统时间未与 NTP 同步，正在尝试开启…'
+  timedatectl set-ntp true >/dev/null 2>&1 || {
+    warn '自动开启失败。不影响节点连接（当前配置未启用时间差校验），'
+    warn '但时间偏差过大会导致 HTTPS 证书校验失败，影响后续更新。'
+    warn '需要校时可执行：apt install -y systemd-timesyncd 或 apt install -y chrony'
+  }
 }
 
 has_ipv6() { ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; }
@@ -487,6 +491,10 @@ render_rules() {
   printf '\n'
 }
 
+# DNS 把 localhost（系统解析器）排在最前：机器能上网就说明它必然可用。
+# 公共 DNS 只作兜底——部分 VPS 到 1.1.1.1 / 8.8.8.8 不通（国内机，或商家
+# 封了出站 53 端口），若把它们排在前面，配合 IPIfNonMatch 会导致每个域名
+# 连接都卡在解析上，表现为"已连接但打不开网页"。
 render_config() {
   local strategy='UseIP'
   has_ipv6 || strategy='UseIPv4'
@@ -499,7 +507,7 @@ render_config() {
     "error": "/var/log/xray/error.log"
   },
   "dns": {
-    "servers": ["1.1.1.1", "8.8.8.8", "localhost"],
+    "servers": ["localhost", "1.1.1.1", "8.8.8.8"],
     "queryStrategy": "${strategy}"
   },
   "inbounds": [
