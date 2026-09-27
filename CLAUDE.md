@@ -87,6 +87,26 @@ Hash32: zzz
 任何对齐都要用 `disp_width()`（在 `LC_ALL=C` 下逐字节解析 UTF-8），
 不能用 `printf %-Ns`（按字节算，必然错位）。注意框线字符 `─` 是 3 字节但**单宽**。
 
+**11. `meta.conf` 是被 `source` 的，写进去的任何值都可能被当成代码。**
+v1.2.1 及之前 `save_meta` 直接写 `KEY='${VAL}'`，而 `valid_addr` 只拦空格：
+- 一个单引号 → 那一行解析失败、地址读回为空，下次保存再把空值**永久写回**，全程显示成功
+- 构造的值（如 `x'$(cmd)'x`）→ 每次加载都执行，包括 root 身份跑的自动更新定时器
+
+现在是三层防护，**哪一层都不要去掉**：
+1. `valid_addr` / `valid_dest` 只接受 IPv4、IPv6、域名这几种格式
+2. `save_meta` 用 `printf '%s=%q'` 写入，任何值都原样往返、逃不出引号
+3. `load_meta` 先 `bash -n` 检查，语法都不对就拒绝加载（报"已损坏"），
+   而不是读进半截数据再写回去
+
+新增任何会进 `meta.conf` 的字段，都要加进 `save_meta` 的字段列表并做格式校验。
+
+**12. 入站监听地址不能写死 `0.0.0.0`。**
+`0.0.0.0` 只绑 IPv4。v1.2.1 及之前就是这样写死的，而 `get_public_ip` 在 IPv4
+探测失败时会退到 IPv6——结果纯 IPv6 机器生成的链接是 `[v6]:443`，Xray 却不在
+IPv6 上监听，节点完全不可达。现在由 `listen_addr()` 按机器实际情况决定，
+决策表见该函数注释。沙箱内核没有 IPv6，`"::"` 在这里会自动退回 IPv4——
+所以双栈行为在沙箱里测不了，只能靠 mock `ip` / `sysctl` 测决策逻辑。
+
 ## 如何测试
 
 **必须用真实 Xray 二进制验证配置**，别只看 `bash -n`。容器里没有 systemd，
@@ -131,6 +151,15 @@ skip && /^\}/ {skip=0} skip {next} {print}' install.sh > /tmp/e2e.sh
 指向临时目录。
 
 **交互路径用 pty 测**：`printf '1\n443\n...\n' | script -qec "bash /tmp/e2e.sh" /dev/null`
+
+**测升级路径**：用 `git show origin/main:install.sh` 取出线上版本先装，再换成新脚本
+执行命令——这正是用户服务器 `selfupdate` 之后的真实状态，最容易出兼容问题。
+
+**写测试断言的一个坑**：计数用 `pass=$((pass+1))`，别用 `((pass++))`。
+后者在 `pass` 为 0 时表达式值为 0、退出码为 1，`cmd && ok || bad` 会两个都触发。
+
+**测试脚本目前只存在于会话 scratchpad，会随会话清理丢失**（已丢过两次）。
+每次都要按本节重建。
 
 **每次改动至少要过**：`bash -n`、`shellcheck -S warning`（零告警）、
 生成的配置经 `xray run -test -format json` 校验、完整生命周期（安装→改参数→卸载）无残留。
