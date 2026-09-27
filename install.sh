@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 #=============================== 常量 ==================================#
 
-readonly SCRIPT_VERSION='1.2.1'
+readonly SCRIPT_VERSION='1.2.2'
 readonly SCRIPT_NAME='VLESS + Reality + Vision 一键脚本'
 readonly REPO_RAW='https://raw.githubusercontent.com/doudoudoubao/VLESS-Reality-Vision/main/install.sh'
 readonly XRAY_INSTALLER='https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh'
@@ -239,6 +239,21 @@ check_clock() {
 }
 
 has_ipv6() { ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; }
+has_ipv4() { ip -4 addr show scope global 2>/dev/null | grep -q 'inet '; }
+
+# 入站监听地址。"::" 在 Linux 默认（bindv6only=0）下同时接受 IPv4 与 IPv6，
+# 没有 IPv6 时 Xray 会自动退回只监听 IPv4。
+# 唯一的例外是 bindv6only=1：此时 "::" 只收 IPv6，若机器还有 IPv4
+# 就保持 0.0.0.0，免得 IPv4 客户端全部断掉。
+# 每种情况下都只会比原先写死 0.0.0.0 更好或持平。
+listen_addr() {
+  has_ipv6 || { printf '0.0.0.0'; return 0; }
+  if [[ $(sysctl -n net.ipv6.bindv6only 2>/dev/null) == '1' ]] && has_ipv4; then
+    printf '0.0.0.0'
+  else
+    printf '::'
+  fi
+}
 
 #=============================== 交互 ==================================#
 
@@ -300,9 +315,41 @@ urlencode() {
 
 valid_port()   { [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 valid_uuid()   { [[ ${1,,} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
-valid_host()   { [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $1 == *.* ]]; }
+valid_host()   { [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && $1 == *.* && ${#1} -le 253 ]]; }
 valid_key()    { [[ $1 =~ ^[A-Za-z0-9_-]{43}$ ]]; }
-valid_addr()   { [[ -n $1 && $1 != *[[:space:]]* && ${#1} -le 253 ]]; }
+
+valid_ipv4() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o
+  for o in "${BASH_REMATCH[@]:1}"; do ((10#$o <= 255)) || return 1; done
+}
+
+# 不做完整的 RFC 4291 校验，目的是只放行十六进制、冒号和点——
+# 这样任何 shell 元字符都进不来，而所有合法 IPv6 写法都能通过
+valid_ipv6() { [[ $1 =~ ^[0-9A-Fa-f:.]+$ && $1 == *:*:* && ${#1} -le 45 ]]; }
+
+# 分享链接用的地址：只接受 IPv4、IPv6 或域名三种格式。
+# 这里放行的值会写进 meta.conf 并在之后被 source，所以必须严格。
+valid_addr() { valid_ipv4 "$1" || valid_ipv6 "$1" || valid_host "$1"; }
+
+# 握手目标：host:port 或 [ipv6]:port
+valid_dest() {
+  local h p
+  if [[ $1 =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]+)$ ]]; then
+    h=${BASH_REMATCH[1]}; p=${BASH_REMATCH[2]}
+    valid_ipv6 "$h" || return 1
+  elif [[ $1 =~ ^([^:]+):([0-9]+)$ ]]; then
+    h=${BASH_REMATCH[1]}; p=${BASH_REMATCH[2]}
+    valid_ipv4 "$h" || valid_host "$h" || return 1
+  else
+    return 1
+  fi
+  valid_port "$p"
+}
+
+# 用户可能直接粘贴带方括号的 IPv6，统一去掉；输出链接时 link_host 会再加回来
+strip_brackets() { local s=$1; s=${s#\[}; s=${s%\]}; printf '%s' "$s"; }
+
 # 节点名允许中文，但禁止空白、引号与反斜杠，避免破坏 JSON 与分享链接
 valid_label()  { [[ -n $1 && ${#1} -le 32 && $1 != *[$'\t\n\r "\\']* ]]; }
 
@@ -407,26 +454,27 @@ PORT=''; DEST=''; SNI=''; PRIVATE_KEY=''; PUBLIC_KEY=''
 SHORT_IDS=''; NODE_HOST=''; BLOCK_BT='1'; BLOCK_ADS='0'
 HOST_CACHE=''
 
+# meta.conf 会被 source，所以每个值都用 %q 转义：无论值里有什么字符，
+# 读回来都原样还原，不可能逃出引号被当成命令执行。
+# 先写同目录临时文件再 mv，写到一半中断也不会留下半截文件。
 save_meta() {
   install -d -m 700 "$DATA_DIR"
-  umask 077
-  cat >"$META_FILE" <<EOF
-# 由 ${SCRIPT_NAME} 生成，请勿手工编辑
-PORT='${PORT}'
-DEST='${DEST}'
-SNI='${SNI}'
-PRIVATE_KEY='${PRIVATE_KEY}'
-PUBLIC_KEY='${PUBLIC_KEY}'
-SHORT_IDS='${SHORT_IDS}'
-NODE_HOST='${NODE_HOST}'
-BLOCK_BT='${BLOCK_BT}'
-BLOCK_ADS='${BLOCK_ADS}'
-EOF
-  chmod 600 "$META_FILE"
+  local tmp k
+  tmp=$(mktemp "${DATA_DIR}/.meta.XXXXXX") || return 1   # mktemp 默认即 600
+  {
+    printf '# 由 %s 生成，请勿手工编辑\n' "$SCRIPT_NAME"
+    for k in PORT DEST SNI PRIVATE_KEY PUBLIC_KEY SHORT_IDS NODE_HOST BLOCK_BT BLOCK_ADS; do
+      printf '%s=%q\n' "$k" "${!k}"
+    done
+  } >"$tmp"
+  mv -f "$tmp" "$META_FILE"
 }
 
 load_meta() {
   [[ -r $META_FILE ]] || return 1
+  # 文件语法都不对时拒绝加载：否则只会读进一半字段，
+  # 下次保存时再把缺失的值永久写回去——静默丢数据比报错更糟
+  bash -n "$META_FILE" 2>/dev/null || return 1
   # shellcheck disable=SC1090
   . "$META_FILE"
   [[ -n $PORT && -n $SNI && -n $PRIVATE_KEY && -n $PUBLIC_KEY ]]
@@ -496,8 +544,9 @@ render_rules() {
 # 封了出站 53 端口），若把它们排在前面，配合 IPIfNonMatch 会导致每个域名
 # 连接都卡在解析上，表现为"已连接但打不开网页"。
 render_config() {
-  local strategy='UseIP'
+  local strategy='UseIP' listen
   has_ipv6 || strategy='UseIPv4'
+  listen=$(listen_addr)
 
   cat <<EOF
 {
@@ -513,7 +562,7 @@ render_config() {
   "inbounds": [
     {
       "tag": "vless-reality",
-      "listen": "0.0.0.0",
+      "listen": "${listen}",
       "port": ${PORT},
       "protocol": "vless",
       "settings": {
@@ -940,6 +989,7 @@ cmd_install() {
   fi
   SNI=$DEST_HOST
   DEST=${OPT_DEST:-"${DEST_HOST}:443"}
+  valid_dest "$DEST" || die "握手目标格式不正确，应为 域名:端口 或 [IPv6]:端口：${DEST}"
 
   # ---- 密钥 ----
   info '生成 Reality 密钥对…'
@@ -957,8 +1007,12 @@ cmd_install() {
   label=${OPT_NAME:-'reality'}
   valid_label "$label" || die "节点名不能含空格、引号或反斜杠，且不超过 32 字符：${label}"
 
-  NODE_HOST=$OPT_HOST
-  [[ -n $NODE_HOST ]] || NODE_HOST=$(get_public_ip) || NODE_HOST=''
+  NODE_HOST=$(strip_brackets "$OPT_HOST")
+  if [[ -n $NODE_HOST ]]; then
+    valid_addr "$NODE_HOST" || die "地址格式不正确，只接受 IPv4、IPv6 或域名：${NODE_HOST}"
+  else
+    NODE_HOST=$(get_public_ip) || NODE_HOST=''
+  fi
   if [[ -z $NODE_HOST ]]; then
     warn '未能自动获取公网 IP，可稍后执行 reality change-host 手动指定。'
   fi
@@ -1193,10 +1247,11 @@ cmd_change_host() {
   require_installed
   local new=$OPT_HOST
   [[ -n $new ]] || new=$(ask '分享链接使用的地址（IP 或域名，留空自动探测）' "$NODE_HOST")
+  new=$(strip_brackets "$new")
   if [[ -z $new ]]; then
     new=$(get_public_ip) || die '自动探测失败，请手动指定。'
   fi
-  valid_addr "$new" || die "地址不合法：${new}"
+  valid_addr "$new" || die "地址格式不正确，只接受 IPv4、IPv6 或域名：${new}"
   NODE_HOST=$new
   HOST_CACHE=''
   save_meta
