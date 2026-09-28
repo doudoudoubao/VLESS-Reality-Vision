@@ -41,7 +41,7 @@ reality install --port 443 --sni www.nvidia.com --name hk --host 1.2.3.4 --yes
 
 | | |
 |---|---|
-| 一键安装 | 自动装内核、生成密钥、写配置、开防火墙、出链接和二维码 |
+| 一键安装 | 自动装内核、生成密钥、写配置、开防火墙（ufw / firewalld / iptables）、出链接和二维码 |
 | 多用户 | 随时增删用户，每个设备一个 UUID，互不影响 |
 | 参数管理 | 改端口、换 SNI、轮换密钥、重建 UUID、改分享地址 |
 | 配置安全网 | 每次改动先做 `xray -test` 自检，失败不落盘；启动异常自动回滚上一份配置 |
@@ -61,6 +61,7 @@ reality link            仅输出分享链接
 reality qr              输出二维码
 reality client          输出 sing-box / Clash.Meta 配置片段
 reality check           一键诊断（连不上时先跑这个）
+reality open-port       重新放行本机防火墙（诊断报告端口被拦时用）
 
 reality add-user        添加用户       reality del-user      删除用户
 reality change-port     修改监听端口   reality change-sni    更换握手目标
@@ -267,13 +268,19 @@ reality check
 
 甲骨文云的系统镜像自带 iptables 规则，只放行 22 端口，其余入站一律拒绝；
 而且网上常见的 `iptables -A` 写法会把放行规则追加到拒绝规则**后面**，永远轮不到它。
-`reality check` 能识别这两种情况并给出正确命令（用 `-I` 插到最前面）：
+
+从 v1.3.0 起安装时会自动处理：检测到 iptables 会拒绝该端口，就把放行规则插到**最前面**，
+并写进开机规则文件（`/etc/iptables/rules.v4` 或 `/etc/sysconfig/iptables`），重启后仍有效。
+这条规则带 `reality` 注释，改端口或卸载时只删它，你自己加的规则一条都不动；
+INPUT 本来就全放行的机器则一条规则都不加。
+
+用旧版本装的机器，更新脚本后执行一次即可：
 
 ```bash
-iptables -I INPUT -p tcp --dport 443 -j ACCEPT && netfilter-persistent save
+reality selfupdate && reality open-port
 ```
 
-除此之外，控制台的安全列表（Security List）同样要放行该端口。
+除此之外，控制台的安全列表（Security List）同样要放行该端口——那是云厂商那一层，本机管不到。
 
 时间未同步（`timedatectl` 显示 `NTP service: inactive`）**不会**导致连不上 ——
 本脚本未启用 Reality 的时间差校验（`maxTimeDiff` 保持默认的 0）。

@@ -125,7 +125,7 @@ pad_to() { # pad_to <字符串> <目标显示宽度>
   local s=${1-} w
   w=$(disp_width "$s")
   printf '%s' "$s"
-  while ((w < $2)); do printf ' '; ((w++)); done
+  while ((w < $2)); do printf ' '; w=$((w + 1)); done   # 别写 ((w++))：w 为 0 时退出码为 1
 }
 
 # 标题栏：╭─ 标题 ─────…
@@ -232,8 +232,9 @@ install_deps() {
 check_clock() {
   command -v timedatectl >/dev/null 2>&1 || return 0
   local synced
-  synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo '')
-  [[ $synced == 'yes' ]] && return 0
+  # 读不到状态（OpenVZ/LXC 这类时间归宿主机管的容器）时不提示：用户改不了，提示只是噪音
+  synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null) || return 0
+  [[ -n $synced && $synced != 'yes' ]] || return 0
   warn '系统时间未与 NTP 同步，正在尝试开启…'
   timedatectl set-ntp true >/dev/null 2>&1 || {
     warn '自动开启失败。不影响节点连接（当前配置未启用时间差校验），'
@@ -359,7 +360,8 @@ valid_label()  { [[ -n $1 && ${#1} -le 32 && $1 != *[$'\t\n\r "\\']* ]]; }
 
 port_in_use() {
   command -v ss >/dev/null 2>&1 || return 1
-  ss -Hltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$1\$"
+  # 不用 -H：老版本 ss 不认识它，会直接报错，结果永远是"未占用"；表头第 4 列是 "Local"，匹配不上
+  ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$1\$"
 }
 
 run_timeout() { # run_timeout <秒> <命令…>
@@ -729,29 +731,191 @@ rollback_config() {
 
 #============================== 防火墙 ================================#
 
+# ufw 的输出会随系统语言翻译，必须在 C locale 下解析
+ufw_active()        { command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active'; }
+firewalld_running() { command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; }
+
+# <端口> 是否在端口列表里：ufw 与 iptables 都允许 80,443 和 400:500 这类写法
+port_listed() { # port_listed <端口> <列表>
+  local p
+  local -a parts=()
+  IFS=',' read -r -a parts <<<"$2"
+  for p in "${parts[@]}"; do
+    if [[ $p =~ ^([0-9]+):([0-9]+)$ ]]; then
+      ((10#$1 >= 10#${BASH_REMATCH[1]} && 10#$1 <= 10#${BASH_REMATCH[2]})) && return 0
+    elif [[ $p =~ ^[0-9]+$ ]]; then
+      ((10#$p == 10#$1)) && return 0
+    fi
+  done
+  return 1
+}
+
+# 从标准输入读 `ufw status verbose`，看有没有放行 <端口>/tcp 的规则
+ufw_allows() { # ufw_allows <端口>
+  local to action _
+  while read -r to action _; do
+    [[ $action == 'ALLOW' || $action == 'LIMIT' ]] || continue   # (v6) 行的第二列不是动作，顺带跳过
+    [[ $to != */udp ]] || continue
+    port_listed "$1" "${to%/tcp}" && return 0
+  done
+  return 1
+}
+
+# 从标准输入读 `iptables -S INPUT`，判断 <端口>/tcp 会不会被放行。只认最常见的写法：
+# 带端口的 ACCEPT，以及不带条件（或只限定 tcp）的 REJECT / DROP——
+# 甲骨文云的系统镜像自带的就是后者，只放行 22 端口。输出：
+#   accept  放行规则在拒绝规则之前
+#   late    放行规则排在拒绝规则之后，永远轮不到它（用 iptables -A 追加的典型错误）
+#   deny    有拒绝规则，没有放行规则
+#   none    没有拒绝规则
+iptables_verdict() { # iptables_verdict <端口>
+  local line verdict='' late=0 policy_deny=0
+  local accept_re=' -j ACCEPT( |$)' port_re=' --dports? ([0-9,:]+)'
+  local deny_re='^-A INPUT( -p tcp( -m tcp)?)? -j (REJECT|DROP)( --reject-with [^ ]+)?$'
+  while read -r line; do
+    case $line in
+      '-P INPUT DROP') policy_deny=1 ;;
+      '-A INPUT '*)
+        if [[ $line =~ $accept_re && ( $line == *' -p tcp '* || $line != *' -p '* ) ]] &&
+           [[ $line =~ $port_re ]] && port_listed "$1" "${BASH_REMATCH[1]}"; then
+          if [[ $verdict == 'deny' ]]; then late=1; else verdict=${verdict:-accept}; fi
+        elif [[ $line =~ $deny_re ]]; then
+          verdict=${verdict:-deny}
+        fi ;;
+    esac
+  done
+  if [[ $verdict == 'accept' ]]; then
+    echo accept
+  elif [[ $verdict == 'deny' ]] || ((policy_deny)); then
+    if ((late)); then echo late; else echo deny; fi
+  else
+    echo none
+  fi
+}
+
+# 本脚本加的 iptables 规则都带这个注释：撤销时只删自己加的，用户原有的同端口规则不动
+readonly IPT_TAG='reality'
+# 开机时整份载入的规则文件（iptables-save 格式）：Debian/Ubuntu 的 iptables-persistent、
+# RHEL 系的 iptables-services。不设为 readonly，测试要把它指到临时文件
+IPT_SAVE_FILES=(/etc/iptables/rules.v4 /etc/sysconfig/iptables)
+
+ipt_file_has() { # ipt_file_has <文件> <端口>：旧版 iptables-nft 保存时会给注释加引号
+  grep -Eq -- "--dport $2 .*--comment \"?${IPT_TAG}\"? " "$1" 2>/dev/null
+}
+
+# 往规则文件里加一行，插在 *filter 表第一条 -A INPUT 之前（表里没有 INPUT 规则就插在
+# 它的 COMMIT 之前），其余内容原样保留。不用 netfilter-persistent save：它会把 Docker、
+# fail2ban 运行时加的规则一并存进去，重启后与它们自己再加的规则重复甚至冲突
+ipt_file_add() { # ipt_file_add <文件> <端口>
+  local f=$1 tmp rc=0
+  ipt_file_has "$f" "$2" && return 0
+  tmp=$(mktemp) || return 1
+  if awk -v rule="-A INPUT -p tcp -m tcp --dport $2 -m comment --comment ${IPT_TAG} -j ACCEPT" '
+       /^\*/ { table = $0 }
+       table == "*filter" && !done && (/^-A INPUT / || /^COMMIT/) { print rule; done = 1 }
+       { print }
+       END { exit !done }' "$f" >"$tmp"; then
+    cat "$tmp" >"$f" || rc=1   # 用 cat 写回：保留原文件的权限、属主与 SELinux 标签
+  else
+    rc=1                       # 没有 *filter 表，不是我们认得的格式，不动它
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
+ipt_file_del() { # ipt_file_del <文件> <端口>：只删本脚本加的那一行
+  local f=$1 tmp rc=0
+  ipt_file_has "$f" "$2" || return 0
+  tmp=$(mktemp) || return 1
+  if awk -v p="--dport $2 " -v tag="--comment \"?${IPT_TAG}\"? " \
+       '!(index($0, p) && $0 ~ tag)' "$f" >"$tmp"; then
+    cat "$tmp" >"$f" || rc=1
+  else
+    rc=1
+  fi
+  rm -f "$tmp"
+  return "$rc"
+}
+
+# 只在 iptables 会拒绝该端口时才动（典型是甲骨文云的系统镜像）：
+# INPUT 本来就全放行的机器一条规则都不加
+iptables_allow() { # iptables_allow <端口>
+  local port=$1 rules f saved=0
+  command -v iptables >/dev/null 2>&1 || return 0
+  rules=$(iptables -S INPUT 2>/dev/null) || return 0
+  case $(iptables_verdict "$port" <<<"$rules") in
+    deny|late) ;;
+    *) return 0 ;;
+  esac
+  # 必须 -I 插到最前面：-A 追加会排在拒绝规则后面，永远轮不到
+  if ! iptables -I INPUT -p tcp --dport "$port" -m comment --comment "$IPT_TAG" -j ACCEPT 2>/dev/null; then
+    warn "iptables 会拒绝 ${port}/tcp，自动放行失败。请手动执行：iptables -I INPUT -p tcp --dport ${port} -j ACCEPT"
+    return 0
+  fi
+  for f in "${IPT_SAVE_FILES[@]}"; do
+    [[ -f $f ]] || continue
+    if ipt_file_add "$f" "$port"; then saved=1; fi
+  done
+  if ((saved)); then
+    info "iptables 已放行 ${port}/tcp（已写入开机规则，重启后仍有效）"
+  else
+    info "iptables 已放行 ${port}/tcp"
+    warn '没找到 iptables 的开机规则文件，重启后这条规则可能失效；届时执行 reality open-port 即可重新放行。'
+  fi
+}
+
+iptables_revoke() { # iptables_revoke <端口>：只删带本脚本注释的规则
+  local port=$1 f
+  command -v iptables >/dev/null 2>&1 || return 0
+  while iptables -D INPUT -p tcp --dport "$port" -m comment --comment "$IPT_TAG" -j ACCEPT 2>/dev/null; do :; done
+  for f in "${IPT_SAVE_FILES[@]}"; do
+    if [[ -f $f ]]; then ipt_file_del "$f" "$port" || true; fi
+  done
+  return 0
+}
+
 firewall_allow() {
-  local port=$1
-  if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active'; then
+  local port=$1 managed=0
+  if ufw_active; then
+    managed=1
     ufw allow "${port}/tcp" >/dev/null 2>&1 && info "ufw 已放行 ${port}/tcp"
   fi
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  if firewalld_running; then
+    managed=1
     firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 &&
       firewall-cmd --reload >/dev/null 2>&1 &&
       info "firewalld 已放行 ${port}/tcp"
   fi
+  # ufw 与 firewalld 自己管理底层规则，它们在管事时不能再绕过它们直接动 iptables
+  if ((managed == 0)); then iptables_allow "$port"; fi
   return 0
 }
 
 firewall_revoke() {
   local port=$1
-  if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active'; then
+  if ufw_active; then
     ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
   fi
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  if firewalld_running; then
     firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
   fi
+  iptables_revoke "$port"   # 只删本脚本加过的，没加过就什么都不做
   return 0
+}
+
+# 按当前端口重新放行本机防火墙，逻辑与安装时完全相同（重复执行无副作用）。
+# 用于事后补救：装完之后才启用的防火墙、旧版本装的甲骨文云机器、reality check 报告被拦
+cmd_open_port() {
+  require_installed
+  firewall_allow "$PORT"
+  ck_firewall
+  if [[ $CK_STATUS == 'fail' ]]; then
+    error "仍未放行：${CK_DETAIL}"
+    return 1
+  fi
+  ok "本机防火墙：${CK_DETAIL}"
+  cloud_firewall_hint
 }
 
 cloud_firewall_hint() {
@@ -868,7 +1032,7 @@ show_all_nodes() {
   section '用户'
   while IFS=$'\t' read -r uuid label || [[ -n ${uuid:-} ]]; do
     [[ -n ${uuid:-} ]] || continue
-    ((idx++))
+    idx=$((idx + 1))
     printf '\n    %s[%d]%s %s%s%s\n' "$C_GREEN" "$idx" "$C_OFF" "$C_BOLD" "${label:-user}" "$C_OFF"
     printf '        %s%s%s\n' "$C_GRAY" "$uuid" "$C_OFF"
     printf '%s%s%s\n' "$C_CYAN" "$(share_link "$uuid" "${label:-user}")" "$C_OFF"
@@ -1590,68 +1754,12 @@ ck_port() {
   fi
 }
 
-# <端口> 是否在端口列表里：ufw 与 iptables 都允许 80,443 和 400:500 这类写法
-port_listed() { # port_listed <端口> <列表>
-  local p
-  local -a parts=()
-  IFS=',' read -r -a parts <<<"$2"
-  for p in "${parts[@]}"; do
-    if [[ $p =~ ^([0-9]+):([0-9]+)$ ]]; then
-      ((10#$1 >= 10#${BASH_REMATCH[1]} && 10#$1 <= 10#${BASH_REMATCH[2]})) && return 0
-    elif [[ $p =~ ^[0-9]+$ ]]; then
-      ((10#$p == 10#$1)) && return 0
-    fi
-  done
-  return 1
-}
-
-# 从标准输入读 `ufw status verbose`，看有没有放行 <端口>/tcp 的规则
-ufw_allows() { # ufw_allows <端口>
-  local to action _
-  while read -r to action _; do
-    [[ $action == 'ALLOW' || $action == 'LIMIT' ]] || continue   # (v6) 行的第二列不是动作，顺带跳过
-    [[ $to != */udp ]] || continue
-    port_listed "$1" "${to%/tcp}" && return 0
-  done
-  return 1
-}
-
-# 从标准输入读 `iptables -S INPUT`，判断 <端口>/tcp 会不会被放行。只认最常见的写法：
-# 带端口的 ACCEPT，以及不带条件（或只限定 tcp）的 REJECT / DROP——
-# 甲骨文云的系统镜像自带的就是后者，只放行 22 端口。输出：
-#   accept  放行规则在拒绝规则之前
-#   late    放行规则排在拒绝规则之后，永远轮不到它（用 iptables -A 追加的典型错误）
-#   deny    有拒绝规则，没有放行规则
-#   none    没有拒绝规则
-iptables_verdict() { # iptables_verdict <端口>
-  local line verdict='' late=0 policy_deny=0
-  local accept_re=' -j ACCEPT( |$)' port_re=' --dports? ([0-9,:]+)'
-  local deny_re='^-A INPUT( -p tcp( -m tcp)?)? -j (REJECT|DROP)( --reject-with [^ ]+)?$'
-  while read -r line; do
-    case $line in
-      '-P INPUT DROP') policy_deny=1 ;;
-      '-A INPUT '*)
-        if [[ $line =~ $accept_re && ( $line == *' -p tcp '* || $line != *' -p '* ) ]] &&
-           [[ $line =~ $port_re ]] && port_listed "$1" "${BASH_REMATCH[1]}"; then
-          if [[ $verdict == 'deny' ]]; then late=1; else verdict=${verdict:-accept}; fi
-        elif [[ $line =~ $deny_re ]]; then
-          verdict=${verdict:-deny}
-        fi ;;
-    esac
-  done
-  if [[ $verdict == 'accept' ]]; then
-    echo accept
-  elif [[ $verdict == 'deny' ]] || ((policy_deny)); then
-    if ((late)); then echo late; else echo deny; fi
-  else
-    echo none
-  fi
-}
-
 # 按 ufw → firewalld → iptables 的顺序找第一个在管事的防火墙。
-# 直接写的 nftables 规则无法可靠判断，所以没发现拦截时措辞是"未发现"，而不是"没有"
+# 直接写的 nftables 规则无法可靠判断，所以没发现拦截时措辞是"未发现"，而不是"没有"。
+# 修复一律指向 reality open-port：它与安装时走同一套逻辑。别改回让用户手敲
+# `netfilter-persistent save`——那会把 Docker、fail2ban 的运行时规则一并存进开机规则
 ck_firewall() {
-  local out fix
+  local out fix='执行 reality open-port 自动放行'
   if command -v ufw >/dev/null 2>&1 && out=$(LC_ALL=C ufw status verbose 2>/dev/null) &&
      [[ $out == *'Status: active'* ]]; then
     if [[ $out == *'Default: allow (incoming)'* ]]; then
@@ -1659,7 +1767,7 @@ ck_firewall() {
     elif ufw_allows "$PORT" <<<"$out"; then
       ck_set ok "ufw 已放行 ${PORT}/tcp"
     else
-      ck_set fail "ufw 已启用，但没有放行 ${PORT}/tcp 的规则" "ufw allow ${PORT}/tcp"
+      ck_set fail "ufw 已启用，但没有放行 ${PORT}/tcp 的规则" "$fix"
     fi
     return
   fi
@@ -1668,18 +1776,11 @@ ck_firewall() {
        { [[ $PORT == 443 ]] && firewall-cmd --query-service=https >/dev/null 2>&1; }; then
       ck_set ok "firewalld 已放行 ${PORT}/tcp"
     else
-      ck_set fail "firewalld 已启用，但没有放行 ${PORT}/tcp" \
-        "firewall-cmd --permanent --add-port=${PORT}/tcp && firewall-cmd --reload"
+      ck_set fail "firewalld 已启用，但没有放行 ${PORT}/tcp" "$fix"
     fi
     return
   fi
   if command -v iptables >/dev/null 2>&1 && out=$(iptables -S INPUT 2>/dev/null); then
-    fix="iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT"
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-      fix+=' && netfilter-persistent save'
-    else
-      fix+='（重启后失效，需另行保存）'
-    fi
     case $(iptables_verdict "$PORT" <<<"$out") in
       accept) ck_set ok "iptables 已放行 ${PORT}/tcp"; return ;;
       late)   ck_set fail "iptables 里放行 ${PORT}/tcp 的规则排在拒绝规则后面，不会生效" "$fix"; return ;;
@@ -2001,6 +2102,8 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   check                   一键诊断：逐项检查内核、配置、服务、端口、防火墙、
                           DNS、伪装目标、分享地址与错误日志，并给出修复方法。
                           发现问题时退出码为 1，可用于定时监控
+  open-port               按当前端口重新放行本机防火墙（ufw / firewalld / iptables），
+                          逻辑与安装时相同，重复执行无副作用
   bbr                     开启 BBR 加速
   uninstall               卸载
   version                 显示版本
@@ -2078,6 +2181,7 @@ dispatch() {
     log|logs)         cmd_log ;;
     bbr)              cmd_bbr ;;
     check)            cmd_check ;;
+    open-port)        cmd_open_port ;;
     uninstall|remove) cmd_uninstall ;;
     version|-v|--version) printf '%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" ;;
     help)             usage ;;

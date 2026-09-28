@@ -244,7 +244,15 @@ done
 
 PORT=443
 MOCK_SS_HEAD='State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process'
-ss() { printf '%s\n%s\n' "$MOCK_SS_HEAD" "$MOCK_SS"; }
+# 模拟老版本 ss：不认识 -H（去掉表头）选项，直接报错
+ss() {
+  [[ $1 == -*H* ]] && { echo "ss: invalid option -- 'H'" >&2; return 255; }
+  printf '%s\n%s\n' "$MOCK_SS_HEAD" "$MOCK_SS"
+}
+MOCK_SS='LISTEN 0 4096 *:443 *:*'
+yes_ '老版本 ss 也能查出端口占用' 'port_in_use 443'
+no_  '4430 不算 443 被占用'      'port_in_use 4430'
+no_  '表头不会被当成端口'        'port_in_use Port'
 MOCK_SS='LISTEN 0 4096 *:443 *:* users:(("xray",pid=1,fd=3))';       ck_port; ck_is 'Xray 在听' ok Xray
 MOCK_SS='LISTEN 0 4096 [::]:443 [::]:* users:(("xray",pid=1,fd=3))'; ck_port; ck_is 'Xray 在听 IPv6' ok Xray
 MOCK_SS='';                                                          ck_port; ck_is '没人在听' fail '没有程序' 'reality log'
@@ -274,7 +282,7 @@ ufw_rules '22/tcp                     ALLOW IN    Anywhere' \
           '443/tcp (v6)               ALLOW IN    Anywhere (v6)'
 ck_firewall; ck_is 'ufw 放行了 443/tcp' ok ufw
 ufw_rules '22/tcp                     ALLOW IN    Anywhere'
-ck_firewall; ck_is 'ufw 只放行了 22' fail ufw 'ufw allow 443/tcp'
+ck_firewall; ck_is 'ufw 只放行了 22' fail ufw 'reality open-port'
 ufw_rules '4430/tcp                   ALLOW IN    Anywhere'
 ck_firewall; ck_is 'ufw 的 4430 不算 443' fail
 ufw_rules '443/udp                    ALLOW IN    Anywhere'
@@ -292,9 +300,9 @@ ck_firewall; ck_is 'ufw 未启用时不看它' ok '未发现'
 
 MOCK_FWD='port:443/tcp'; ck_firewall; ck_is 'firewalld 放行了端口' ok firewalld
 MOCK_FWD='svc:https';    ck_firewall; ck_is 'firewalld 的 https 服务等于放行 443' ok
-PORT=8443;               ck_firewall; ck_is 'https 服务不管 8443' fail firewalld '--add-port=8443/tcp'
+PORT=8443;               ck_firewall; ck_is 'https 服务不管 8443' fail firewalld 'reality open-port'
 PORT=443 MOCK_FWD='svc:ssh'
-ck_firewall; ck_is 'firewalld 没放行' fail firewalld 'firewall-cmd --permanent --add-port=443/tcp'
+ck_firewall; ck_is 'firewalld 没放行' fail firewalld 'reality open-port'
 MOCK_FWD=off
 
 # 甲骨文云系统镜像自带的规则：只放行 22，最后一条拒绝其余所有入站
@@ -306,11 +314,11 @@ ORACLE_HEAD='-P INPUT ACCEPT
 ORACLE_REJECT='-A INPUT -j REJECT --reject-with icmp-host-prohibited'
 ACCEPT_443='-A INPUT -p tcp -m state --state NEW -m tcp --dport 443 -j ACCEPT'
 MOCK_IPT="$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"
-ck_firewall; ck_is '甲骨文云默认规则拒绝 443' fail iptables 'iptables -I INPUT -p tcp --dport 443 -j ACCEPT'
+ck_firewall; ck_is '甲骨文云默认规则拒绝 443' fail iptables 'reality open-port'
 MOCK_IPT="$ORACLE_HEAD"$'\n'"$ACCEPT_443"$'\n'"$ORACLE_REJECT"
 ck_firewall; ck_is '放行规则在拒绝之前' ok iptables
 MOCK_IPT="$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"$'\n'"$ACCEPT_443"
-ck_firewall; ck_is '用 -A 追加到拒绝之后：不生效' fail '排在拒绝规则后面' 'iptables -I INPUT'
+ck_firewall; ck_is '用 -A 追加到拒绝之后：不生效' fail '排在拒绝规则后面' 'reality open-port'
 MOCK_IPT="$ORACLE_HEAD"$'\n''-A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT'$'\n'"$ORACLE_REJECT"
 ck_firewall; ck_is 'multiport 写法' ok
 MOCK_IPT="$ORACLE_HEAD"$'\n''-A INPUT -p udp -m udp --dport 443 -j ACCEPT'$'\n'"$ORACLE_REJECT"
@@ -323,10 +331,6 @@ MOCK_IPT=$'-P INPUT DROP\n-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT'
 ck_firewall; ck_is '默认策略 DROP 但放行了 443' ok
 MOCK_IPT=$'-P INPUT ACCEPT\n-A INPUT -s 10.0.0.0/8 -j DROP'
 ck_firewall; ck_is '带条件的 DROP 不当作全部拒绝' ok '未发现'
-MOCK_IPT="$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"
-netfilter-persistent() { :; }
-ck_firewall; ck_is '有 netfilter-persistent 时提示保存' fail '' 'netfilter-persistent save'
-unset -f netfilter-persistent
 iptables() { return 1; }   # 非 root 时 iptables -S 会失败
 ck_firewall; ck_is 'iptables 读不到规则时不误报' ok '未发现'
 unset -f ufw firewall-cmd iptables ufw_rules
@@ -364,10 +368,13 @@ ck_binary; ck_is '内核跑不起来' fail '' 'reality update'
 ck_config; ck_is '内核跑不起来时跳过配置检查，不重复报错' skip
 restore_fns; CK_BIN_OK=1
 
-timedatectl() { [[ $MOCK_NTP != fail ]] && echo "$MOCK_NTP"; }
+timedatectl() { [[ $1 == show && $MOCK_NTP != fail ]] && echo "$MOCK_NTP"; }
 MOCK_NTP=yes;  ck_clock; ck_is '时间已同步' ok
 MOCK_NTP=no;   ck_clock; ck_is '时间未同步只提醒' warn
 MOCK_NTP=fail; ck_clock; ck_is '读不到状态时跳过，不当成未同步' skip
+# 安装时的 check_clock 同理：容器型 VPS 读不到状态，不该刷出一串用户改不了的警告
+MOCK_NTP=fail; eq_ '安装时读不到时间状态：不提示' "$(check_clock 2>&1)" ''
+MOCK_NTP=no;   yes_ '安装时确实未同步：照常提示' '[[ $(check_clock 2>&1) == *未与\ NTP\ 同步* ]]'
 unset -f timedatectl
 
 getent() {
@@ -476,5 +483,124 @@ yes_ '跳过项标记为 -'     '[[ $out == *"- 伪装目标"* ]]'
 
 out=$(is_installed() { return 1; }; show_menu)
 yes_ '菜单里有 18 节点诊断' '[[ $out == *"18"*节点诊断* ]]'
+
+group '16. 甲骨文云式 iptables：安装时自动放行'
+# 真实 iptables 的行为由 e2e 在独立网络命名空间里测；这里测规则文件的改写与各种决策分支
+RULES=$WORK/rules.v4
+cat >"$WORK/rules.orig" <<'EOF'
+*nat
+:PREROUTING ACCEPT [0:0]
+-A PREROUTING -p tcp -m tcp --dport 8080 -j REDIRECT --to-ports 80
+COMMIT
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+COMMIT
+EOF
+TAG443='-A INPUT -p tcp -m tcp --dport 443 -m comment --comment reality -j ACCEPT'
+TAG4430='-A INPUT -p tcp -m tcp --dport 4430 -m comment --comment reality -j ACCEPT'
+line_of() { grep -nF -- "$1" "$2" | head -n1 | cut -d: -f1; }
+cnt()     { grep -cF -- "$1" "$2"; }
+
+cp "$WORK/rules.orig" "$RULES"
+yes_ '写入开机规则文件'                  'ipt_file_add "$RULES" 443'
+eq_  '插在 filter 表第一条 INPUT 规则之前' "$(line_of "$TAG443" "$RULES")" "$(( $(line_of '-A INPUT -m state' "$RULES") - 1 ))"
+yes_ '不会插进 nat 表'                    '(( $(line_of "$TAG443" "$RULES") > $(line_of "*filter" "$RULES") ))'
+ipt_file_add "$RULES" 443
+eq_  '重复写入不重复'                     "$(cnt "$TAG443" "$RULES")" 1
+ipt_file_add "$RULES" 4430
+sed -i "s/^-A INPUT -j REJECT/-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT\n&/" "$RULES"   # 用户自己的规则
+ipt_file_del "$RULES" 443
+eq_  '删除本脚本的 443 规则'              "$(cnt "$TAG443" "$RULES")" 0
+eq_  '不动 4430 的规则'                   "$(cnt "$TAG4430" "$RULES")" 1
+eq_  '不动用户自己的 443 规则'            "$(cnt '--dport 443 -j ACCEPT' "$RULES")" 1
+cp "$WORK/rules.orig" "$RULES"; ipt_file_add "$RULES" 443; ipt_file_del "$RULES" 443
+yes_ '加了再删，文件恢复原样'             'cmp -s "$RULES" "$WORK/rules.orig"'
+cp "$WORK/rules.orig" "$RULES"; ipt_file_add "$RULES" 443
+sed -i 's/--comment reality/--comment "reality"/' "$RULES"   # 旧版 iptables-nft 保存时会给注释加引号
+ipt_file_del "$RULES" 443
+yes_ '带引号的注释也认得'                 'cmp -s "$RULES" "$WORK/rules.orig"'
+printf '*nat\n:PREROUTING ACCEPT [0:0]\nCOMMIT\n' >"$RULES"; cp "$RULES" "$WORK/nat-only"
+no_  '没有 filter 表时不写'               'ipt_file_add "$RULES" 443'
+yes_ '且文件不变'                         'cmp -s "$RULES" "$WORK/nat-only"'
+printf '*filter\n:INPUT DROP [0:0]\nCOMMIT\n' >"$RULES"
+ipt_file_add "$RULES" 443
+eq_  'filter 表没有 INPUT 规则时插在 COMMIT 之前' "$(sed -n 3p "$RULES")" "$TAG443"
+
+# 决策：什么时候动 iptables、动完怎么提示
+# 有状态：-I 插入的规则会出现在之后的 -S 里（插在第一行的策略之后），
+# 这样才测得出"放行之后再检查就通过了"
+iptables() {
+  printf '%s\n' "$*" >>"$WORK/ipt-calls"
+  case $1 in
+    -S) printf '%s\n' "$MOCK_IPT" ;;
+    -I) [[ ${MOCK_IPT_RC:-0} == 0 ]] || return 1
+        MOCK_IPT=$(sed "1a -A ${*:2}" <<<"$MOCK_IPT") ;;
+    *)  return 1 ;;   # -D：没有可删的规则
+  esac
+}
+ufw() { :; }
+save_fn ufw_active; save_fn firewalld_running
+ufw_active() { [[ $MOCK_UFW_ON == 1 ]]; }
+firewalld_running() { return 1; }
+allow_case() { # allow_case <INPUT 链规则>：跑一次 firewall_allow 443，记录调用和输出
+  MOCK_IPT=$1; : >"$WORK/ipt-calls"; cp "$WORK/rules.orig" "$RULES"
+  ALLOW_OUT=$(firewall_allow 443 2>&1)
+}
+IPT_SAVE_FILES=("$RULES") MOCK_UFW_ON=0 MOCK_IPT_RC=0
+allow_case "$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"
+yes_ '拒绝 443 时插到最前面' 'grep -qx -- "-I INPUT -p tcp --dport 443 -m comment --comment reality -j ACCEPT" "$WORK/ipt-calls"'
+eq_  '并写进开机规则文件'    "$(cnt "$TAG443" "$RULES")" 1
+yes_ '提示已持久化'          '[[ $ALLOW_OUT == *已写入开机规则* ]]'
+allow_case "$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"$'\n'"$ACCEPT_443"
+yes_ '放行规则排在拒绝之后时也插' 'grep -q -- "^-I INPUT" "$WORK/ipt-calls"'
+allow_case '-P INPUT ACCEPT'
+no_  '全放行的机器不动 iptables'  'grep -q -- "^-I INPUT" "$WORK/ipt-calls"'
+yes_ '也不动规则文件'             'cmp -s "$RULES" "$WORK/rules.orig"'
+allow_case "$ORACLE_HEAD"$'\n'"$ACCEPT_443"$'\n'"$ORACLE_REJECT"
+no_  '已经放行的端口不重复加'     'grep -q -- "^-I INPUT" "$WORK/ipt-calls"'
+MOCK_UFW_ON=1
+allow_case "$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"
+eq_  'ufw 在管事时完全不碰 iptables' "$(cat "$WORK/ipt-calls")" ''
+MOCK_UFW_ON=0 MOCK_IPT_RC=1
+allow_case "$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"
+yes_ '插入失败时给出手动命令'     '[[ $ALLOW_OUT == *"iptables -I INPUT -p tcp --dport 443 -j ACCEPT"* ]]'
+yes_ '且不写规则文件'             'cmp -s "$RULES" "$WORK/rules.orig"'
+MOCK_IPT_RC=0 IPT_SAVE_FILES=("$WORK/no-such-file")
+allow_case "$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"
+yes_ '没有开机规则文件时提醒重启后会失效' '[[ $ALLOW_OUT == *重启后*失效* ]]'
+
+# reality open-port：reality check 报告端口被拦时的一键补救
+IPT_SAVE_FILES=("$RULES")
+open_port() { # open_port <INPUT 链规则>：跑一次 reality open-port，记下输出与退出码
+  MOCK_IPT=$1; : >"$WORK/ipt-calls"; cp "$WORK/rules.orig" "$RULES"
+  OPEN_OUT=$(require_installed() { :; }; cmd_open_port 2>&1); OPEN_RC=$?
+}
+PORT=443
+open_port "$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"
+eq_  'open-port 修好甲骨文云规则：退出码 0' "$OPEN_RC" 0
+yes_ 'open-port 放行后复查通过'             '[[ $OPEN_OUT == *"iptables 已放行 443/tcp"* && $OPEN_OUT != *仍未放行* ]]'
+open_port '-P INPUT ACCEPT'
+eq_  'open-port 在无需放行时也正常结束'     "$OPEN_RC" 0
+yes_ '且如实说明没有拦截'                   '[[ $OPEN_OUT == *未发现本机防火墙拦截* ]]'
+MOCK_IPT_RC=1
+open_port "$ORACLE_HEAD"$'\n'"$ORACLE_REJECT"
+eq_  'open-port 放行失败：退出码 1'         "$OPEN_RC" 1
+yes_ '放行失败时如实报告'                   '[[ $OPEN_OUT == *仍未放行* ]]'
+MOCK_IPT_RC=0
+restore_fns; unset -f iptables ufw allow_case open_port
+
+group '17. set -e 下不会中途退出'
+# ((x++)) 在 x 为 0 时退出码为 1。现在能正常工作只是因为 main 以 `dispatch || exit` 调用，
+# 屏蔽了 set -e——这层保护一旦改动，reality info 就会在列第一个用户时直接退出
+out=$(set -Eeuo pipefail; show_all_nodes >/dev/null 2>&1; echo END)
+eq_ 'show_all_nodes 列完全部用户' "$out" 'END'
+# 直接调用而不是放进 $()：命令替换里 set -e 会被清掉，看不出问题
+out=$(set -Eeuo pipefail; pad_to '' 3; echo '|')
+eq_ 'pad_to 处理空字符串' "$out" '   |'
 
 summary

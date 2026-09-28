@@ -39,6 +39,9 @@
 | 诊断里"读不到 / 测不了"一律跳过（skip），不报失败也不报提醒 | 误报比漏报更糟：会让用户去修一个不存在的问题，甚至照提示执行 `change-host` 把好好的链接改坏。例：OpenVZ/LXC 读不到时钟状态、探测不到公网 IP、`/etc/hosts` 把节点域名指到 127.0.1.1 |
 | `ck_host` 先看地址在不在本机网卡上，再比对出口 IP | 多 IP 的机器出口 IP 未必是分享链接里那个 |
 | 菜单"节点诊断"追加为 18，不插到前面 | 改动已有编号会让老用户按习惯输入时误触（比如误入 17 卸载） |
+| iptables 只在检测到会拒绝该端口时才动，且 ufw / firewalld 在管事时完全不碰 | INPUT 全放行的机器加规则纯属多余；ufw、firewalld 自己管理底层规则，绕过它们直接改会被覆盖或冲突 |
+| 本脚本加的 iptables 规则都带 `-m comment --comment reality` | 改端口、卸载时只删自己加的，用户原有的同端口规则一条不动 |
+| 持久化是往开机规则文件里插一行，不用 `netfilter-persistent save` | 后者把当前全部规则存盘，会连 Docker、fail2ban 运行时加的规则一起存进去，重启后与它们自己再加的重复甚至冲突。`reality check` 的修复提示也因此统一指向 `reality open-port`，别改回让用户手敲那条命令 |
 
 ## 踩过的坑（改代码前必读）
 
@@ -124,6 +127,12 @@ v1.2.x 的 `reality log` 只看 journal，运行时的报错根本看不到。
 v1.2.x 的 `firewall_allow` 因此在这类系统上从来没放行过端口，且不报任何错。
 凡是解析 ufw 输出的地方都要加 `LC_ALL=C`。
 
+**15. `main` 里的 `dispatch || exit $?` 让 `set -e` 失效，会掩盖 bug。**
+在 `||` 左边调用的函数里，`set -e` 与 ERR trap 都不生效（bash 的规定）。
+所以 `((idx++))`（idx 为 0 时退出码为 1）这种写法平时"能用"，一旦换个调用方式就会中途退出。
+v1.2.x 的 `reality info` 列用户、`pad_to` 补空格都是这么写的，已改成 `x=$((x + 1))`。
+`unit.sh` 第 17 组在 `set -e` 下直接调用它们，防止再写回去。
+
 ## 如何测试
 
 ```bash
@@ -159,6 +168,9 @@ sudo bash tests/e2e.sh      # 端到端：真实安装再卸载，会写 /usr/lo
   这正是用户 `selfupdate` 之后的真实状态。CI 里以 root 跑、仓库属于 runner 用户，
   git 会拒绝操作，所以要 `git -c safe.directory=…`
 - **测试里的函数名别叫 `section`**：`install.sh` 里有同名 UI 函数，source 之后会被覆盖
+- **真实 iptables 只在独立网络命名空间里测**（`unshare -n`，见 `e2e.sh` 的 G 组）：
+  规则只存在于那个命名空间，进程结束就消失，绝不碰本机防火墙。
+  甲骨文云的默认规则里有一条拒绝全部入站的 REJECT，在本机上试等于把自己关在门外
 
 **写断言的一个坑**：计数用 `pass=$((pass + 1))`，别用 `((pass++))`。
 后者在 `pass` 为 0 时退出码为 1，`cmd && ok_ || bad_` 会两个分支都触发。
@@ -188,10 +200,7 @@ sudo bash tests/e2e.sh      # 端到端：真实安装再卸载，会写 /usr/lo
 
 ## 待办
 
-- **安装时自动放行 iptables**（甲骨文云）：`firewall_allow` 目前只处理 ufw / firewalld。
-  甲骨文云的系统镜像自带 `-A INPUT -j REJECT`（只放行 22），装完照样连不上——
-  `reality check` 能指出来并给出 `iptables -I` 命令，但不会自动修。
-  要做的话得处理持久化（`netfilter-persistent`），且只在检测到拒绝规则时才动。
+- IPv6 的 ip6tables 目前不处理：甲骨文云等机器若 IPv6 入站也被拒绝，纯 IPv6 节点仍需手动放行。
 - 其它候选（未承诺）：`reality check` 失败时推送通知（退出码已就绪，缺通知渠道）、备份/恢复、每用户流量统计（`xray api statsquery` 可用）、
   用户到期管理、WARP 分流。
 - 明确不做：内置 Web 面板（新增攻击面）、塞进其它协议（项目定位是 Reality 专用）、
