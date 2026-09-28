@@ -109,65 +109,54 @@ IPv6 上监听，节点完全不可达。现在由 `listen_addr()` 按机器实�
 
 ## 如何测试
 
-**必须用真实 Xray 二进制验证配置**，别只看 `bash -n`。容器里没有 systemd，
-用下面这套 mock 环境（`systemctl` 的 `is-active` 只在二进制真能跑时才返回 0，
-这样才能测出"新版本起不来自动回滚"的路径）：
-
 ```bash
-SC="$SCRATCHPAD"   # 用会话的 scratchpad 目录
-mkdir -p "$SC" && cd "$SC"
-curl -fsSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-unzip -oq xray.zip xray geoip.dat geosite.dat && chmod +x xray
-mkdir -p /usr/local/share/xray && cp geoip.dat geosite.dat /usr/local/share/xray/
-
-mkdir -p /tmp/mockbin /run/systemd/system
-cat > /tmp/mockbin/systemctl <<'EOF'
-#!/bin/bash
-case "$*" in
-  *"show -p User --value xray"*) echo nobody; exit 0 ;;
-  *"is-active"*) /usr/local/bin/xray version >/dev/null 2>&1 && exit 0 || exit 3 ;;
-esac
-exit 0
-EOF
-printf '#!/bin/bash\nexit 0\n' > /tmp/mockbin/journalctl
-chmod +x /tmp/mockbin/systemctl /tmp/mockbin/journalctl
-export PATH=/tmp/mockbin:$PATH
+bash tests/unit.sh          # 单元测试：不需要 root，只读写临时目录
+sudo bash tests/e2e.sh      # 端到端：真实安装再卸载，会写 /usr/local 等系统路径
 ```
 
-官方安装脚本要访问 `api.github.com`，开发沙箱按策略拦截（403），所以把
-`install_xray_core` 打桩成直接放二进制，其余全部走真实代码：
+两套测试都会自动下载**最新版** Xray 二进制（与脚本线上行为一致）；
+`XRAY_TEST_VERSION=v26.3.27` 可固定版本复现某次结果。CI（见下）每次提交都会跑全部。
 
-```bash
-awk -v bin="$SC/xray" '
-/^install_xray_core\(\) \{/ {print "install_xray_core() {";
-  print "  install -m 755 \"" bin "\" /usr/local/bin/xray"; skip=1; next}
-skip && /^\}/ {skip=0} skip {next} {print}' install.sh > /tmp/e2e.sh
-```
+**⚠ `e2e.sh` 会覆盖本机的 Xray 安装。** 它检测到 `/usr/local/bin/xray` 等路径已存在
+时会拒绝运行——这个保护是为了防止有人在自己的线上服务器上试跑。开发容器里
+有残留时用 `REALITY_E2E_FORCE=1`。结束时只清理它自己新建的路径。
 
-**把脚本当库来测**：`REALITY_LIB=1` 时只加载函数不执行 `main`，
-可以直接调用 `disp_width`、`valid_port`、`render_config` 等做单元测试
-（记得 source 之后 `trap - ERR; set +Eeuo pipefail` 恢复测试环境）。
-路径常量是 `readonly`，测试时用 `sed` 改写 `XRAY_CONF_DIR` / `DATA_DIR` / `XRAY_BIN`
-指向临时目录。
+公共机制都在 `tests/helpers.sh`，改之前先理解为什么这么做：
 
-**交互路径用 pty 测**：`printf '1\n443\n...\n' | script -qec "bash /tmp/e2e.sh" /dev/null`
+- **必须用真实 Xray 校验配置**，别只看 `bash -n`——坑 1、4、6 都是只有真实二进制才暴露的
+- **mock systemctl**：容器里没有 systemd。`is-active` 只在二进制真能跑时返回 0，
+  这样才测得出"新版本起不来 → 自动回滚"的路径
+- **打桩 `install_xray_core`**：官方安装脚本要访问 `api.github.com`，开发沙箱会拦截（403）。
+  只替换这一个函数，其余全部走真实代码
+- **`XRAY_LOCATION_ASSET`**：打桩后官方脚本不装 geodata，路由里的 `geoip:private`
+  要靠它找到数据文件，否则 `apply_config` 的自检必然失败
+- **把脚本当库测**：`REALITY_LIB=1` 时只加载函数不执行 `main`。路径常量是 `readonly`，
+  所以用 `sed` 改写 `XRAY_CONF_DIR` / `DATA_DIR` / `XRAY_BIN` 后再 source；
+  source 之后要 `trap - ERR; set +Eeuo pipefail` 恢复测试环境
+- **升级路径以 `OLD_REF`（默认 `origin/main`）为基线**：先用线上版本装，再换新脚本执行命令，
+  这正是用户 `selfupdate` 之后的真实状态。CI 里以 root 跑、仓库属于 runner 用户，
+  git 会拒绝操作，所以要 `git -c safe.directory=…`
+- **测试里的函数名别叫 `section`**：`install.sh` 里有同名 UI 函数，source 之后会被覆盖
 
-**测升级路径**：用 `git show origin/main:install.sh` 取出线上版本先装，再换成新脚本
-执行命令——这正是用户服务器 `selfupdate` 之后的真实状态，最容易出兼容问题。
+**写断言的一个坑**：计数用 `pass=$((pass + 1))`，别用 `((pass++))`。
+后者在 `pass` 为 0 时退出码为 1，`cmd && ok_ || bad_` 会两个分支都触发。
 
-**写测试断言的一个坑**：计数用 `pass=$((pass+1))`，别用 `((pass++))`。
-后者在 `pass` 为 0 时表达式值为 0、退出码为 1，`cmd && ok || bad` 会两个都触发。
+**静态检查的一个坑**：注释只要以 `# shellcheck` 开头就会被当成指令解析，
+写说明文字时换个开头。
 
-**测试脚本目前只存在于会话 scratchpad，会随会话清理丢失**（已丢过两次）。
-每次都要按本节重建。
+**交互路径**目前没有自动化测试，手动用 pty 测：
+`printf '1\n443\n...\n' | script -qec "bash 打桩后的脚本" /dev/null`
 
-**每次改动至少要过**：`bash -n`、`shellcheck -S warning`（零告警）、
-生成的配置经 `xray run -test -format json` 校验、完整生命周期（安装→改参数→卸载）无残留。
+**新增功能时**：往 `tests/unit.sh` 或 `tests/e2e.sh` 里加对应用例。
+修 bug 时先写一个能复现它的用例，确认它失败，再修。
 
 ## 开发流程
 
 - 在指定的 `claude/*` 分支开发，PR 合并到 `main`
-- CI（`.github/workflows/shellcheck.yml`）跑 `bash -n` + `shellcheck -S warning`，必须零告警
+- CI（`.github/workflows/ci.yml`）三个任务必须全绿：`shellcheck`（`bash -n` +
+  `shellcheck -S warning`，含测试脚本）、`unit`、`e2e`
+- CI 每周一还会用最新 Xray 内核自动重跑一次，专门捕捉上游变更。
+  这时变红而代码没改过，说明 Xray 的行为变了，脚本需要跟进
 - 一键命令实时从 `main` 拉取，**合并即生效**，没有缓存
 - 改了用户可见行为就升版本号（`SCRIPT_VERSION`），虽然 `selfupdate` 按内容比对不依赖它
 - 界面文案用中文

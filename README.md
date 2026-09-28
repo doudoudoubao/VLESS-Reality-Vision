@@ -271,6 +271,19 @@ reality uninstall
 
 调用官方脚本的 `remove --purge` 移除内核，并清理本脚本的全部数据、管理命令与防火墙规则。
 
+## 开发与测试
+
+```bash
+bash tests/unit.sh          # 单元测试，不需要 root，不改动系统
+sudo bash tests/e2e.sh      # 端到端测试，会真实安装再卸载
+```
+
+> ⚠ 端到端测试会覆盖本机的 Xray 安装，**只应在 CI 或一次性虚拟机里运行**。
+> 检测到本机已有安装时会拒绝运行，不会误伤线上节点。
+
+每次提交都会在 GitHub Actions 上自动跑全部测试。另外每周一会用最新版 Xray
+内核再跑一次——脚本线上装的永远是最新内核，上游一旦改了行为，这里会先报警。
+
 ## 致谢
 
 - [XTLS/Xray-core](https://github.com/XTLS/Xray-core) —— Reality / Vision 的实现
