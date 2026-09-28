@@ -46,6 +46,7 @@ reality install --port 443 --sni www.nvidia.com --name hk --host 1.2.3.4 --yes
 | 参数管理 | 改端口、换 SNI、轮换密钥、重建 UUID、改分享地址 |
 | 配置安全网 | 每次改动先做 `xray -test` 自检，失败不落盘；启动异常自动回滚上一份配置 |
 | 目标可用性检测 | 选 SNI 时实测目标是否支持 TLS1.3 + HTTP/2，不合格当场提示 |
+| 一键诊断 | `reality check` 几秒内查完内核、配置、服务、端口、防火墙、DNS、伪装目标、分享地址、错误日志，每个问题都附修法 |
 | 客户端导出 | 分享链接、二维码、sing-box 出站、Clash.Meta 节点片段 |
 | 跟随官方更新 | 每次更新都现拉官方安装脚本装最新内核，可开启每日自动更新，新版本起不来会自动回滚 |
 | 其它 | BBR 加速、路由拦截规则、实时日志、干净卸载 |
@@ -59,6 +60,7 @@ reality info            查看节点信息（含全部用户）
 reality link            仅输出分享链接
 reality qr              输出二维码
 reality client          输出 sing-box / Clash.Meta 配置片段
+reality check           一键诊断（连不上时先跑这个）
 
 reality add-user        添加用户       reality del-user      删除用户
 reality change-port     修改监听端口   reality change-sni    更换握手目标
@@ -216,17 +218,62 @@ www.lovelive-anime.jp             shopping.yahoo.co.jp
 
 **连不上怎么办？**
 
-按顺序排查：
+先在服务器上跑一次诊断（或在菜单里选 `18`）：
 
-1. `reality status` 看服务是否在运行；
-2. 云服务器控制台的**安全组**是否放行了对应 TCP 端口（这是最常见的原因，
-   脚本只能处理服务器内部的 ufw / firewalld，管不到云厂商的安全组）；
-3. 客户端的 SNI、公钥、短 ID、flow 是否与 `reality info` 输出完全一致；
-4. **客户端是否支持 Reality** —— 需要同时支持 VLESS、Reality 和
+```bash
+reality check
+```
+
+它会沿着链路从本机往外逐项检查，每个问题都给出具体的修复命令，例如：
+
+```
+╭─ 节点诊断 ──────────────────────────────────────────────────
+  ✓ Xray 内核   Xray 26.3.27
+  ✓ 配置文件    通过自检，权限正确
+  ✓ 服务状态    运行中
+  ✓ 端口监听    443/tcp 由 Xray 监听
+  ✓ 本机防火墙  未发现本机防火墙拦截
+  ✓ 系统时间    已与 NTP 同步
+  ✓ DNS 解析    系统解析器正常（www.microsoft.com）
+  ✗ 伪装目标    从本机无法与 www.microsoft.com:443 完成 TLS1.3 握手
+               → 伪装目标可能已失效或被墙：执行 reality change-sni 换一个
+  ✓ 分享地址    203.0.113.10 指向本机
+  ✓ 错误日志    没有错误记录
+
+  云服务器的安全组无法在本机检测：以上都正常却仍连不上时，请到控制台确认放行了 TCP 443。
+╰─────────────────────────────────────────────────────────────
+  发现 1 个问题。按上面 → 的提示处理。
+```
+
+节点"用着用着突然不能用"，最常见的两个原因它都能直接指出来：
+**伪装目标悄悄失效**（网站改了配置、上了 CDN，或从服务器那边被墙），
+以及**服务器换了 IP** 而分享链接还是旧地址。
+发现问题时退出码为 1，也可以放进定时任务做监控。
+
+诊断全部通过却仍然连不上，问题就在服务器之外了：
+
+1. 云服务器控制台的**安全组**是否放行了对应 TCP 端口（这是最常见的原因，
+   本机上无法检测，脚本也管不到云厂商的安全组）；
+2. 客户端的 SNI、公钥、短 ID、flow 是否与 `reality info` 输出完全一致；
+3. **客户端是否支持 Reality** —— 需要同时支持 VLESS、Reality 和
    `xtls-rprx-vision` 流控，缺一样都连不上。已实测可用的有
    Shadowrocket 与 Quantumult X（较新版本）。判断方法：看客户端能否
-   填入「公钥 / Short ID / 指纹」这三个 Reality 专有字段，填不了就是不支持；
-5. `reality log` 看实时错误日志。
+   填入「公钥 / Short ID / 指纹」这三个 Reality 专有字段，填不了就是不支持。
+
+需要看原始日志时用 `reality log`：先列出最近的启动记录（服务起不来的原因在这里），
+再实时跟踪运行日志 `/var/log/xray/error.log`，按 Ctrl+C 返回。
+
+**甲骨文云（Oracle Cloud）装完连不上？**
+
+甲骨文云的系统镜像自带 iptables 规则，只放行 22 端口，其余入站一律拒绝；
+而且网上常见的 `iptables -A` 写法会把放行规则追加到拒绝规则**后面**，永远轮不到它。
+`reality check` 能识别这两种情况并给出正确命令（用 `-I` 插到最前面）：
+
+```bash
+iptables -I INPUT -p tcp --dport 443 -j ACCEPT && netfilter-persistent save
+```
+
+除此之外，控制台的安全列表（Security List）同样要放行该端口。
 
 时间未同步（`timedatectl` 显示 `NTP service: inactive`）**不会**导致连不上 ——
 本脚本未启用 Reality 的时间差校验（`maxTimeDiff` 保持默认的 0）。

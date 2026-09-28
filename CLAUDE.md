@@ -33,6 +33,12 @@
 | `selfupdate` 只手动、不自动 | 让服务器无人值守地自动执行来自网络的新代码，风险大于收益。内核自动更新是另一回事（那是官方签名的发布） |
 | `selfupdate` 按**文件内容**比对而非版本号 | 修了 bug 忘记改版本号时不会漏掉更新 |
 | 界面默认用 Unicode 制表符，不看 `LANG` | 界面本身全是中文，终端不支持 UTF-8 的话中文早就乱码了；最小化云镜像常常没设 `LANG`，据此降级会让正常终端白白吃到 ASCII 界面。留 `REALITY_ASCII=1` 作为退路 |
+| `install` 的命令行参数在任何耗时操作之前全部校验（`validate_install_opts`） | 否则要等 30 秒装完内核才报 `--host` 写错，而且内核已经装上了 |
+| `reality check` 每项检查只设 `CK_STATUS` / `CK_DETAIL` / `CK_HINT`，不直接输出 | 每项都能单独用模拟测试；输出格式集中在 `print_ck` 一处 |
+| 前置项失败时后续项跳过（`CK_BIN_OK` / `CK_DNS_OK`） | 一个根因只报一次。否则内核坏了会连带报"配置自检失败"，把人往错误方向引 |
+| 诊断里"读不到 / 测不了"一律跳过（skip），不报失败也不报提醒 | 误报比漏报更糟：会让用户去修一个不存在的问题，甚至照提示执行 `change-host` 把好好的链接改坏。例：OpenVZ/LXC 读不到时钟状态、探测不到公网 IP、`/etc/hosts` 把节点域名指到 127.0.1.1 |
+| `ck_host` 先看地址在不在本机网卡上，再比对出口 IP | 多 IP 的机器出口 IP 未必是分享链接里那个 |
+| 菜单"节点诊断"追加为 18，不插到前面 | 改动已有编号会让老用户按习惯输入时误触（比如误入 17 卸载） |
 
 ## 踩过的坑（改代码前必读）
 
@@ -107,6 +113,17 @@ IPv6 上监听，节点完全不可达。现在由 `listen_addr()` 按机器实�
 决策表见该函数注释。沙箱内核没有 IPv6，`"::"` 在这里会自动退回 IPv4——
 所以双栈行为在沙箱里测不了，只能靠 mock `ip` / `sysctl` 测决策逻辑。
 
+**13. Xray 的日志分在两处。**
+配置里设了 error 日志文件后，运行时的报错只写 `XRAY_LOG`、不进 journal；
+而配置错误导致起不来时日志组件还没初始化，原因只进 journal。
+v1.2.x 的 `reality log` 只看 journal，运行时的报错根本看不到。
+现在两处都显示：先列 journal 最近 15 行，再跟踪日志文件。
+
+**14. `ufw status` 的输出会被翻译。**
+装了中文语言包的系统上显示的是「状态：激活」而不是 `Status: active`，
+v1.2.x 的 `firewall_allow` 因此在这类系统上从来没放行过端口，且不报任何错。
+凡是解析 ufw 输出的地方都要加 `LC_ALL=C`。
+
 ## 如何测试
 
 ```bash
@@ -131,8 +148,13 @@ sudo bash tests/e2e.sh      # 端到端：真实安装再卸载，会写 /usr/lo
 - **`XRAY_LOCATION_ASSET`**：打桩后官方脚本不装 geodata，路由里的 `geoip:private`
   要靠它找到数据文件，否则 `apply_config` 的自检必然失败
 - **把脚本当库测**：`REALITY_LIB=1` 时只加载函数不执行 `main`。路径常量是 `readonly`，
-  所以用 `sed` 改写 `XRAY_CONF_DIR` / `DATA_DIR` / `XRAY_BIN` 后再 source；
+  所以用 `sed` 改写 `XRAY_CONF_DIR` / `DATA_DIR` / `XRAY_LOG` / `XRAY_BIN` 后再 source；
   source 之后要 `trap - ERR; set +Eeuo pipefail` 恢复测试环境
+- **用同名函数模拟系统命令**（`ss`、`ufw`、`iptables`、`getent`、`openssl`…）：
+  `command -v` 对函数同样返回成功，所以"命令存在"也一并模拟了。两个例外：
+  外部的 `timeout` 调不到 shell 函数，单元测试里把 `run_timeout` 换成了直接执行；
+  install.sh **自己的**函数不能模拟完直接 `unset -f`——那会把真实实现一起删掉，
+  要用 `save_fn` / `restore_fns`
 - **升级路径以 `OLD_REF`（默认 `origin/main`）为基线**：先用线上版本装，再换新脚本执行命令，
   这正是用户 `selfupdate` 之后的真实状态。CI 里以 root 跑、仓库属于 runner 用户，
   git 会拒绝操作，所以要 `git -c safe.directory=…`
@@ -141,14 +163,17 @@ sudo bash tests/e2e.sh      # 端到端：真实安装再卸载，会写 /usr/lo
 **写断言的一个坑**：计数用 `pass=$((pass + 1))`，别用 `((pass++))`。
 后者在 `pass` 为 0 时退出码为 1，`cmd && ok_ || bad_` 会两个分支都触发。
 
-**静态检查的一个坑**：注释只要以 `# shellcheck` 开头就会被当成指令解析，
-写说明文字时换个开头。
+**静态检查的两个坑**：注释只要以 `# shellcheck` 开头就会被当成指令解析，
+写说明文字时换个开头。另外静态检查跟不进 source 的 install.sh，
+"先调真实函数、再定义同名模拟"会被误报为 SC2218，`unit.sh` 顶部已整体关掉。
 
-**交互路径**目前没有自动化测试，手动用 pty 测：
-`printf '1\n443\n...\n' | script -qec "bash 打桩后的脚本" /dev/null`
+**交互路径**用伪终端驱动，`e2e.sh` 里的菜单 18 就是这么测的：
+`printf '18\n\n0\n' | script -qec "bash 打桩后的脚本" /dev/null`
 
 **新增功能时**：往 `tests/unit.sh` 或 `tests/e2e.sh` 里加对应用例。
 修 bug 时先写一个能复现它的用例，确认它失败，再修。
+新写的检查逻辑还要反过来验证用例本身：故意改坏实现（比如去掉端口匹配的 `$` 锚点），
+确认有用例变红。`reality check` 的用例就是这样逐项验证过的。
 
 ## 开发流程
 
@@ -163,12 +188,11 @@ sudo bash tests/e2e.sh      # 端到端：真实安装再卸载，会写 /usr/lo
 
 ## 待办
 
-- **`reality check` 诊断命令**（已讨论未实现，优先级最高）：一条命令查全链路——
-  服务是否运行、端口是否监听、防火墙、**伪装目标当前是否仍可达**、DNS 能否解析、
-  公网 IP 是否还与分享链接一致、配置权限、最近错误日志。
-  动机很实在：曾有一台节点"突然不能用"，来回排查十几轮才定位，
-  而这些检查加起来不到十秒。伪装目标悄悄失效是节点用着用着就挂掉的典型原因。
-- 其它候选（未承诺）：备份/恢复、每用户流量统计（`xray api statsquery` 可用）、
+- **安装时自动放行 iptables**（甲骨文云）：`firewall_allow` 目前只处理 ufw / firewalld。
+  甲骨文云的系统镜像自带 `-A INPUT -j REJECT`（只放行 22），装完照样连不上——
+  `reality check` 能指出来并给出 `iptables -I` 命令，但不会自动修。
+  要做的话得处理持久化（`netfilter-persistent`），且只在检测到拒绝规则时才动。
+- 其它候选（未承诺）：`reality check` 失败时推送通知（退出码已就绪，缺通知渠道）、备份/恢复、每用户流量统计（`xray api statsquery` 可用）、
   用户到期管理、WARP 分流。
 - 明确不做：内置 Web 面板（新增攻击面）、塞进其它协议（项目定位是 Reality 专用）、
   订阅链接托管（一个明文 URL 泄露全部节点）。

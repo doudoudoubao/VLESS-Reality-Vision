@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 #=============================== 常量 ==================================#
 
-readonly SCRIPT_VERSION='1.2.2'
+readonly SCRIPT_VERSION='1.3.0'
 readonly SCRIPT_NAME='VLESS + Reality + Vision 一键脚本'
 readonly REPO_RAW='https://raw.githubusercontent.com/doudoudoubao/VLESS-Reality-Vision/main/install.sh'
 readonly XRAY_INSTALLER='https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh'
@@ -27,6 +27,7 @@ readonly XRAY_BIN='/usr/local/bin/xray'
 readonly XRAY_CONF_DIR='/usr/local/etc/xray'
 readonly XRAY_CONF="${XRAY_CONF_DIR}/config.json"
 readonly XRAY_UNIT='/etc/systemd/system/xray.service'
+readonly XRAY_LOG='/var/log/xray/error.log'
 readonly DATA_DIR='/usr/local/etc/xray/reality'
 readonly META_FILE="${DATA_DIR}/meta.conf"
 readonly USERS_FILE="${DATA_DIR}/users.tsv"
@@ -65,9 +66,12 @@ fi
 # 因此默认直接用制表符；仅在 REALITY_ASCII=1 时退回纯 ASCII。
 if [[ ${REALITY_ASCII:-0} == '1' ]]; then
   GL_H='-'; GL_TL='+'; GL_BL='+'; GL_DOT='-'; GL_ON='*'; GL_OFF='o'
+  GL_PASS='+'; GL_FAIL='x'
 else
   GL_H='─'; GL_TL='╭'; GL_BL='╰'; GL_DOT='·'; GL_ON='●'; GL_OFF='○'
+  GL_PASS='✓'; GL_FAIL='✗'   # 都是单宽字符；⚠ 可能被渲染成双宽 emoji，所以提醒用 !
 fi
+GL_WARN='!'; GL_SKIP='-'
 readonly UI_WIDTH=62
 
 info() { printf '%s[信息]%s %s\n' "$C_BLUE" "$C_OFF" "$*"; }
@@ -397,11 +401,14 @@ gen_keypair() {
 
 openssl_has_tls13() { openssl s_client -help 2>&1 | grep -q -- '-tls1_3'; }
 
-# 检查偷取目标是否满足 Reality 要求：TLS1.3 + HTTP/2
-check_dest() { # check_dest <host> [port]
-  local host=$1 port=${2:-443} out=''
+# 检查偷取目标是否满足 Reality 要求：TLS1.3 + HTTP/2。
+# SNI 默认同 host；--dest 与 SNI 不同时要传入 SNI，因为 Xray 转发的握手里带的是 SNI。
+check_dest() { # check_dest <host> [port] [SNI]
+  local host=$1 port=${2:-443} sni=${3:-$1} target out=''
   openssl_has_tls13 || return 4
-  out=$(run_timeout 10 openssl s_client -connect "${host}:${port}" -servername "$host" \
+  target="${host}:${port}"
+  valid_ipv6 "$host" && target="[${host}]:${port}"   # 不加方括号时 IPv6 与端口无法区分
+  out=$(run_timeout 10 openssl s_client -connect "$target" -servername "$sni" \
         -tls1_3 -alpn h2 </dev/null 2>/dev/null) || return 1
   grep -q 'ALPN protocol: h2' <<<"$out" || return 2
   grep -q 'TLSv1.3' <<<"$out" || return 3
@@ -435,18 +442,23 @@ describe_dest_result() {
   esac
 }
 
-get_public_ip() {
+# 通过外部服务探测本机公网 IP。返回值必须严格校验：它会写进 meta.conf 和分享链接，
+# 不能因为某个服务返回了奇怪的内容就原样收下（此前 IPv6 只检查了"含冒号"）
+public_ip() { # public_ip <4|6>
   local url ip
-  for url in 'https://api.ipify.org' 'https://ipv4.icanhazip.com' 'https://ifconfig.me/ip'; do
-    ip=$(curl -fsS4 --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]') || ip=''
-    [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { printf '%s' "$ip"; return 0; }
-  done
-  for url in 'https://api6.ipify.org' 'https://ipv6.icanhazip.com'; do
-    ip=$(curl -fsS6 --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]') || ip=''
-    [[ $ip == *:* ]] && { printf '%s' "$ip"; return 0; }
+  local -a urls=('https://api.ipify.org' 'https://ipv4.icanhazip.com' 'https://ifconfig.me/ip')
+  [[ $1 == 6 ]] && urls=('https://api6.ipify.org' 'https://ipv6.icanhazip.com')
+  for url in "${urls[@]}"; do
+    ip=$(curl -fsS"$1" --max-time "${IP_PROBE_TIMEOUT:-6}" "$url" 2>/dev/null | tr -d '[:space:]') || ip=''
+    if { [[ $1 == 4 ]] && valid_ipv4 "$ip"; } || { [[ $1 == 6 ]] && valid_ipv6 "$ip"; }; then
+      printf '%s' "$ip"
+      return 0
+    fi
   done
   return 1
 }
+
+get_public_ip() { public_ip 4 || public_ip 6; }
 
 #============================= 元数据存取 =============================#
 
@@ -553,7 +565,7 @@ render_config() {
   "log": {
     "loglevel": "warning",
     "access": "none",
-    "error": "/var/log/xray/error.log"
+    "error": "${XRAY_LOG}"
   },
   "dns": {
     "servers": ["localhost", "1.1.1.1", "8.8.8.8"],
@@ -630,13 +642,13 @@ service_user() {
   printf '%s' "${u:-root}"
 }
 
-# 配置中的 error 日志指向 /var/log/xray，缺失时 Xray 连自检都无法通过
+# 配置中的 error 日志指向 XRAY_LOG，其目录缺失时 Xray 连自检都无法通过
 ensure_log_dir() {
-  local u g
-  install -d -m 755 /var/log/xray 2>/dev/null || return 0
+  local u g dir=${XRAY_LOG%/*}
+  install -d -m 755 "$dir" 2>/dev/null || return 0
   u=$(service_user)
   g=$(id -gn "$u" 2>/dev/null || printf '%s' "$u")
-  chown "$u:$g" /var/log/xray 2>/dev/null || true
+  chown "$u:$g" "$dir" 2>/dev/null || true
   return 0
 }
 
@@ -719,7 +731,7 @@ rollback_config() {
 
 firewall_allow() {
   local port=$1
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw allow "${port}/tcp" >/dev/null 2>&1 && info "ufw 已放行 ${port}/tcp"
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
@@ -732,7 +744,7 @@ firewall_allow() {
 
 firewall_revoke() {
   local port=$1
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
@@ -942,6 +954,23 @@ choose_dest() {
   done
 }
 
+# install 的命令行参数在做任何耗时操作之前统一校验：写错了应当立刻报错，
+# 而不是等装完 Xray（约半分钟）才发现，还留下一个没配置的内核
+validate_install_opts() {
+  [[ -z $OPT_PORT ]] || valid_port "$OPT_PORT" || die "端口非法：${OPT_PORT}"
+  [[ -z $OPT_SNI  ]] || valid_host "$OPT_SNI"  || die "SNI 格式不正确：${OPT_SNI}"
+  [[ -z $OPT_DEST ]] || valid_dest "$OPT_DEST" ||
+    die "握手目标格式不正确，应为 域名:端口 或 [IPv6]:端口：${OPT_DEST}"
+  [[ -z $OPT_UUID ]] || valid_uuid "$OPT_UUID" || die "UUID 格式不正确：${OPT_UUID}"
+  [[ -z $OPT_NAME ]] || valid_label "$OPT_NAME" ||
+    die "节点名不能含空格、引号或反斜杠，且不超过 32 字符：${OPT_NAME}"
+  if [[ -n $OPT_HOST ]]; then
+    valid_addr "$(strip_brackets "$OPT_HOST")" ||
+      die "地址格式不正确，只接受 IPv4、IPv6 或域名：${OPT_HOST}"
+  fi
+  return 0
+}
+
 cmd_install() {
   require_systemd
   detect_os
@@ -951,12 +980,15 @@ cmd_install() {
     return 1
   fi
 
+  validate_install_opts
+
   printf '\n%s%s v%s%s\n' "$C_BOLD" "$SCRIPT_NAME" "$SCRIPT_VERSION" "$C_OFF"
   printf '系统：%s\n\n' "$OS_PRETTY"
 
-  install_deps
+  install_deps    # 很快；下面检测端口占用要用 ss，检测伪装目标要用 openssl
   check_clock
-  install_xray_core
+
+  # 交互提问全部放在下载内核之前：答完就可以离开，不必守着等下载
 
   # ---- 端口 ----
   PORT=${OPT_PORT:-}
@@ -981,8 +1013,7 @@ cmd_install() {
   # ---- 偷取目标 ----
   local DEST_HOST=''
   if [[ -n $OPT_SNI ]]; then
-    valid_host "$OPT_SNI" || die "SNI 格式不正确：${OPT_SNI}"
-    warn_dest_risk "$OPT_SNI"
+    warn_dest_risk "$OPT_SNI"   # 格式已由 validate_install_opts 校验
     DEST_HOST=$OPT_SNI
   else
     choose_dest
@@ -991,28 +1022,23 @@ cmd_install() {
   DEST=${OPT_DEST:-"${DEST_HOST}:443"}
   valid_dest "$DEST" || die "握手目标格式不正确，应为 域名:端口 或 [IPv6]:端口：${DEST}"
 
-  # ---- 密钥 ----
+  # 以上是全部需要用户参与的部分，下面开始耗时的安装
+  install_xray_core
+
+  # ---- 密钥（需要 xray 二进制）----
   info '生成 Reality 密钥对…'
   gen_keypair || die '密钥生成失败，请确认 Xray 安装完整。'
   SHORT_IDS="$(gen_shortid),$(gen_shortid)"
 
   # ---- 首个用户 ----
+  # --uuid / --name / --host 的格式都已由 validate_install_opts 校验
   local uuid label
   uuid=$OPT_UUID
-  if [[ -n $uuid ]]; then
-    valid_uuid "$uuid" || die "UUID 格式不正确：${uuid}"
-  else
-    uuid=$(gen_uuid) || die 'UUID 生成失败。'
-  fi
+  [[ -n $uuid ]] || uuid=$(gen_uuid) || die 'UUID 生成失败。'
   label=${OPT_NAME:-'reality'}
-  valid_label "$label" || die "节点名不能含空格、引号或反斜杠，且不超过 32 字符：${label}"
 
   NODE_HOST=$(strip_brackets "$OPT_HOST")
-  if [[ -n $NODE_HOST ]]; then
-    valid_addr "$NODE_HOST" || die "地址格式不正确，只接受 IPv4、IPv6 或域名：${NODE_HOST}"
-  else
-    NODE_HOST=$(get_public_ip) || NODE_HOST=''
-  fi
+  [[ -n $NODE_HOST ]] || NODE_HOST=$(get_public_ip) || NODE_HOST=''
   if [[ -z $NODE_HOST ]]; then
     warn '未能自动获取公网 IP，可稍后执行 reality change-host 手动指定。'
   fi
@@ -1414,10 +1440,19 @@ cmd_stop()    { systemctl stop xray && ok 'Xray 已停止。'; }
 cmd_start()   { systemctl start xray && ok 'Xray 已启动。'; }
 cmd_status()  { systemctl status xray --no-pager -l 2>&1 | head -n 20; }
 
+# 日志分两处：配置错误导致起不来时，日志组件还没初始化，原因只进 journal；
+# 运行起来以后的报错只写 XRAY_LOG。只看其中一处，总有一类问题看不到
 cmd_log() {
+  if command -v journalctl >/dev/null 2>&1; then
+    section '最近的启动记录（起不来的原因在这里）'
+    journalctl -u xray -n 15 --no-pager 2>/dev/null | sed 's/^/  /' || true
+  fi
+  section "运行日志 ${XRAY_LOG}"
   info '按 Ctrl+C 退出日志跟踪。'
-  journalctl -u xray -n 50 -f --no-pager 2>/dev/null ||
-    tail -n 50 -f /var/log/xray/error.log
+  # 捕获 Ctrl+C 只为结束 tail 后回到菜单，而不是连脚本一起退出
+  trap : INT
+  tail -n 50 -F "$XRAY_LOG" 2>/dev/null || true
+  trap - INT
 }
 
 cmd_bbr() {
@@ -1479,6 +1514,349 @@ cmd_uninstall() {
   ok '已全部卸载。'
 }
 
+#=============================== 诊断 =================================#
+
+# 每项检查只设置三个值、不直接输出，便于单独测试：
+#   CK_STATUS  ok | warn | fail | skip
+#   CK_DETAIL  检查结果
+#   CK_HINT    怎么修（ok 时不显示）
+#   后面的检查依赖前面的结果时（内核跑不起来、DNS 不通），直接跳过而不是跟着报错，
+#   免得一个根因刷出一串失败
+CK_STATUS=''; CK_DETAIL=''; CK_HINT=''; CK_BIN_OK=1; CK_DNS_OK=1
+ck_set() { CK_STATUS=$1; CK_DETAIL=$2; CK_HINT=${3:-}; }
+
+ck_binary() {
+  local v; v=$(xray_version)
+  if [[ -n $v ]]; then
+    ck_set ok "Xray ${v}"; CK_BIN_OK=1
+  else
+    ck_set fail '内核无法运行' '执行 reality update 重新安装内核'; CK_BIN_OK=0
+  fi
+}
+
+ck_config() {
+  if [[ $CK_BIN_OK == 0 ]]; then ck_set skip '跳过：内核无法运行，先解决上一项'; return; fi
+  local out why
+  if ! out=$(xray_test_config "$XRAY_CONF"); then
+    # 报错形如 "Failed to start: main: … > … > 真正的原因"，只取最后一段
+    why=$(grep -m1 'Failed to start' <<<"$out") || why=''
+    why=${why##*> }
+    ck_set fail "未通过 Xray 自检${why:+：${why:0:60}}" \
+      "完整报错：xray run -test -config ${XRAY_CONF}"
+    return
+  fi
+  local perm owner want meta_perm
+  perm=$(stat -c %a "$XRAY_CONF" 2>/dev/null)
+  owner=$(stat -c %U "$XRAY_CONF" 2>/dev/null)
+  meta_perm=$(stat -c %a "$META_FILE" 2>/dev/null)
+  want=$(service_user)
+  if [[ $meta_perm != 600 ]]; then
+    ck_set warn "通过自检，但 meta.conf 权限为 ${meta_perm}（其中有私钥）" "chmod 600 ${META_FILE}"
+  elif [[ $perm != 600 || $owner != "$want" ]]; then
+    ck_set warn "通过自检，但权限为 ${perm}（属于 ${owner}），私钥可能被本机其他用户读到" \
+      "chown ${want} ${XRAY_CONF} && chmod 600 ${XRAY_CONF}"
+  else
+    ck_set ok '通过自检，权限正确'
+  fi
+}
+
+ck_service() {
+  local state
+  if state=$(systemctl is-active xray 2>/dev/null); then ck_set ok '运行中'; return; fi
+  case $state in
+    failed)     state='启动失败' ;;
+    activating) state='正在启动，可能在反复崩溃重启' ;;
+    inactive)   state='已停止' ;;
+  esac
+  ck_set fail "未运行（${state:-状态未知}）" '执行 reality restart；还起不来就执行 reality log 查看原因'
+}
+
+# 进程在跑不等于端口在听：配置错、端口被占都会让服务反复重启
+ck_port() {
+  if ! command -v ss >/dev/null 2>&1; then ck_set skip '系统没有 ss 命令，跳过'; return; fi
+  local lines who
+  # 不用 -H：老版本 ss 不认识它；表头的第 4 列是 "Local"，本来就匹配不上
+  lines=$(ss -ltnp 2>/dev/null | awk -v p=":${PORT}\$" '$4 ~ p')
+  if [[ -z $lines ]]; then
+    ck_set fail "没有程序在监听 ${PORT}/tcp" '服务可能一启动就退出了，执行 reality log 查看原因'
+  elif [[ $lines == *'"xray"'* ]]; then
+    ck_set ok "${PORT}/tcp 由 Xray 监听"
+  elif [[ $lines != *users:* ]]; then
+    ck_set ok "${PORT}/tcp 正在监听"   # 看不到进程信息时只能确认端口已打开
+  else
+    who=$(grep -oE 'users:\(\("[^"]+"' <<<"$lines" | head -n1 | cut -d'"' -f2)
+    ck_set fail "${PORT}/tcp 被其它程序（${who:-未知}）占用" \
+      '停掉占用端口的程序，或执行 reality change-port 换一个端口'
+  fi
+}
+
+# <端口> 是否在端口列表里：ufw 与 iptables 都允许 80,443 和 400:500 这类写法
+port_listed() { # port_listed <端口> <列表>
+  local p
+  local -a parts=()
+  IFS=',' read -r -a parts <<<"$2"
+  for p in "${parts[@]}"; do
+    if [[ $p =~ ^([0-9]+):([0-9]+)$ ]]; then
+      ((10#$1 >= 10#${BASH_REMATCH[1]} && 10#$1 <= 10#${BASH_REMATCH[2]})) && return 0
+    elif [[ $p =~ ^[0-9]+$ ]]; then
+      ((10#$p == 10#$1)) && return 0
+    fi
+  done
+  return 1
+}
+
+# 从标准输入读 `ufw status verbose`，看有没有放行 <端口>/tcp 的规则
+ufw_allows() { # ufw_allows <端口>
+  local to action _
+  while read -r to action _; do
+    [[ $action == 'ALLOW' || $action == 'LIMIT' ]] || continue   # (v6) 行的第二列不是动作，顺带跳过
+    [[ $to != */udp ]] || continue
+    port_listed "$1" "${to%/tcp}" && return 0
+  done
+  return 1
+}
+
+# 从标准输入读 `iptables -S INPUT`，判断 <端口>/tcp 会不会被放行。只认最常见的写法：
+# 带端口的 ACCEPT，以及不带条件（或只限定 tcp）的 REJECT / DROP——
+# 甲骨文云的系统镜像自带的就是后者，只放行 22 端口。输出：
+#   accept  放行规则在拒绝规则之前
+#   late    放行规则排在拒绝规则之后，永远轮不到它（用 iptables -A 追加的典型错误）
+#   deny    有拒绝规则，没有放行规则
+#   none    没有拒绝规则
+iptables_verdict() { # iptables_verdict <端口>
+  local line verdict='' late=0 policy_deny=0
+  local accept_re=' -j ACCEPT( |$)' port_re=' --dports? ([0-9,:]+)'
+  local deny_re='^-A INPUT( -p tcp( -m tcp)?)? -j (REJECT|DROP)( --reject-with [^ ]+)?$'
+  while read -r line; do
+    case $line in
+      '-P INPUT DROP') policy_deny=1 ;;
+      '-A INPUT '*)
+        if [[ $line =~ $accept_re && ( $line == *' -p tcp '* || $line != *' -p '* ) ]] &&
+           [[ $line =~ $port_re ]] && port_listed "$1" "${BASH_REMATCH[1]}"; then
+          if [[ $verdict == 'deny' ]]; then late=1; else verdict=${verdict:-accept}; fi
+        elif [[ $line =~ $deny_re ]]; then
+          verdict=${verdict:-deny}
+        fi ;;
+    esac
+  done
+  if [[ $verdict == 'accept' ]]; then
+    echo accept
+  elif [[ $verdict == 'deny' ]] || ((policy_deny)); then
+    if ((late)); then echo late; else echo deny; fi
+  else
+    echo none
+  fi
+}
+
+# 按 ufw → firewalld → iptables 的顺序找第一个在管事的防火墙。
+# 直接写的 nftables 规则无法可靠判断，所以没发现拦截时措辞是"未发现"，而不是"没有"
+ck_firewall() {
+  local out fix
+  if command -v ufw >/dev/null 2>&1 && out=$(LC_ALL=C ufw status verbose 2>/dev/null) &&
+     [[ $out == *'Status: active'* ]]; then
+    if [[ $out == *'Default: allow (incoming)'* ]]; then
+      ck_set ok 'ufw 默认放行所有入站'
+    elif ufw_allows "$PORT" <<<"$out"; then
+      ck_set ok "ufw 已放行 ${PORT}/tcp"
+    else
+      ck_set fail "ufw 已启用，但没有放行 ${PORT}/tcp 的规则" "ufw allow ${PORT}/tcp"
+    fi
+    return
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    if firewall-cmd --query-port="${PORT}/tcp" >/dev/null 2>&1 ||
+       { [[ $PORT == 443 ]] && firewall-cmd --query-service=https >/dev/null 2>&1; }; then
+      ck_set ok "firewalld 已放行 ${PORT}/tcp"
+    else
+      ck_set fail "firewalld 已启用，但没有放行 ${PORT}/tcp" \
+        "firewall-cmd --permanent --add-port=${PORT}/tcp && firewall-cmd --reload"
+    fi
+    return
+  fi
+  if command -v iptables >/dev/null 2>&1 && out=$(iptables -S INPUT 2>/dev/null); then
+    fix="iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT"
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      fix+=' && netfilter-persistent save'
+    else
+      fix+='（重启后失效，需另行保存）'
+    fi
+    case $(iptables_verdict "$PORT" <<<"$out") in
+      accept) ck_set ok "iptables 已放行 ${PORT}/tcp"; return ;;
+      late)   ck_set fail "iptables 里放行 ${PORT}/tcp 的规则排在拒绝规则后面，不会生效" "$fix"; return ;;
+      deny)   ck_set fail "iptables 会拒绝 ${PORT}/tcp（没有放行它的规则）" "$fix"; return ;;
+    esac
+  fi
+  ck_set ok '未发现本机防火墙拦截'
+}
+
+# 时间不准不影响连接（见 check_clock 的说明），所以最多只是提醒
+# 读不到状态（没有 timedatectl、OpenVZ/LXC 这类时间归宿主机管的容器）时跳过，
+# 不能当成"未同步"去提醒一件用户根本改不了的事
+ck_clock() {
+  local synced
+  if ! command -v timedatectl >/dev/null 2>&1 ||
+     ! synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null) || [[ -z $synced ]]; then
+    ck_set skip '读不到时间同步状态，跳过'
+    return
+  fi
+  if [[ $synced == 'yes' ]]; then
+    ck_set ok '已与 NTP 同步'
+  else
+    ck_set warn '未与 NTP 同步' \
+      '不影响节点连接，但偏差过大会让 HTTPS 证书校验失败、更新下载不了。可执行 apt install -y chrony'
+  fi
+}
+
+# 用伪装域名测系统解析器：它本身就必须能解析，Xray 的 DNS 也以系统解析器为首选
+ck_dns() {
+  if run_timeout 5 getent hosts "$SNI" >/dev/null 2>&1; then
+    ck_set ok "系统解析器正常（${SNI}）"
+    CK_DNS_OK=1
+  else
+    ck_set fail "无法解析 ${SNI}" \
+      '检查 /etc/resolv.conf。DNS 不通时的典型表现是：节点能连上，但网页打不开'
+    CK_DNS_OK=0
+  fi
+}
+
+# 伪装目标悄悄失效（网站改了配置、上了 CDN、被墙）是节点用着用着就挂的典型原因，
+# 而客户端那边只会显示连不上，看不出原因
+ck_dest() {
+  local host port rc=0
+  port=${DEST##*:}
+  host=$(strip_brackets "${DEST%:*}")
+  # 目标是域名而 DNS 已经不通时，这一项必然失败，再报一次只会误导
+  if [[ $CK_DNS_OK == 0 ]] && ! valid_ipv4 "$host" && ! valid_ipv6 "$host"; then
+    ck_set skip '跳过：DNS 解析失败，先解决上一项'
+    return
+  fi
+  check_dest "$host" "$port" "$SNI" || rc=$?
+  case $rc in
+    0) ck_set ok "${DEST} 支持 TLS1.3 + HTTP/2" ;;
+    1) ck_set fail "从本机无法与 ${DEST} 完成 TLS1.3 握手" \
+         '伪装目标可能已失效或被墙：执行 reality change-sni 换一个' ;;
+    2) ck_set fail "${DEST} 不再支持 HTTP/2" '执行 reality change-sni 换一个' ;;
+    3) ck_set fail "${DEST} 不再支持 TLS1.3" '执行 reality change-sni 换一个' ;;
+    4) ck_set skip 'openssl 版本过旧，无法检测' ;;
+    *) ck_set warn "检测异常（代码 ${rc}）" ;;
+  esac
+}
+
+local_addrs() { ip -o addr show 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}'; }
+
+# 服务器换了 IP 后分享链接会整体失效，这是另一类"突然连不上"
+ck_host() {
+  if [[ -z $NODE_HOST ]]; then
+    ck_set warn '未设置，分享链接里是 YOUR_SERVER_IP' '执行 reality change-host <本机 IP 或域名>'
+    return
+  fi
+  local IP_PROBE_TIMEOUT=4 addrs a pub4='' pub6='' have4=0 have6=0 matched=0 now
+  # getent 对字面 IP 直接原样返回（顺带把 IPv6 规整成标准写法），对域名则做解析。
+  # 本机没有对应协议栈时它连字面 IP 都不返回，这时直接拿原值比较
+  addrs=$(run_timeout 5 getent ahosts "$NODE_HOST" 2>/dev/null | awk '{print $1}' | sort -u)
+  if [[ -z $addrs ]] && { valid_ipv4 "$NODE_HOST" || valid_ipv6 "$NODE_HOST"; }; then
+    addrs=${NODE_HOST,,}
+  fi
+  if [[ -z $addrs ]]; then
+    ck_set fail "${NODE_HOST} 解析不到任何地址" '检查该域名的 DNS 记录'
+    return
+  fi
+  # 主机名与节点域名相同时，/etc/hosts 常把它指到 127.0.1.1，这说明不了公网 DNS 的情况
+  addrs=$(grep -Ev '^(127\.|::1$)' <<<"$addrs") || addrs=''
+  if [[ -z $addrs ]]; then
+    ck_set skip "${NODE_HOST} 在本机解析为回环地址（多半来自 /etc/hosts），无法核对"
+    return
+  fi
+  # 地址就在本机网卡上，肯定指向本机——多 IP 的机器出口 IP 未必是它，不能只比出口 IP
+  if grep -qxFf <(local_addrs) <<<"$addrs"; then
+    ck_set ok "${NODE_HOST} 指向本机"
+    return
+  fi
+  while read -r a; do
+    if valid_ipv6 "$a"; then have6=1; else have4=1; fi
+  done <<<"$addrs"
+  if ((have4)); then pub4=$(public_ip 4) || pub4=''; fi
+  if ((have6)); then pub6=$(public_ip 6) || pub6=''; fi
+  if [[ -z $pub4 && -z $pub6 ]]; then
+    ck_set skip '无法探测本机公网 IP，跳过'
+    return
+  fi
+  while read -r a; do
+    if [[ $a == "$pub4" || $a == "$pub6" ]]; then matched=1; fi
+  done <<<"$addrs"
+  if ((matched)); then
+    ck_set ok "${NODE_HOST} 指向本机"
+  else
+    now=${pub4:-$pub6}
+    ck_set fail "${NODE_HOST} 与本机公网 IP ${now} 不一致，分享链接已失效" \
+      "若是服务器换了 IP，执行 reality change-host ${now}，再把新链接导入客户端"
+  fi
+}
+
+ck_log() {
+  local since recent n last
+  if [[ ! -s $XRAY_LOG ]]; then ck_set ok '没有错误记录'; return; fi
+  # 日志行以 "2026/09/28 03:18:23" 开头，这种格式按字符串比较即按时间比较
+  since=$(date -d '24 hours ago' '+%Y/%m/%d %H:%M:%S' 2>/dev/null) || since=''
+  recent=$(awk -v s="$since" 'substr($0, 1, 19) >= s && /\[Error\]/' "$XRAY_LOG")
+  if [[ -z $recent ]]; then ck_set ok '近 24 小时没有错误'; return; fi
+  n=$(wc -l <<<"$recent")
+  # 去掉时间、级别和连接编号：… [Error] [3183754453] app/…: 原因
+  last=$(tail -n1 <<<"$recent" | sed -E 's/.*\[Error\][[:space:]]*(\[[0-9]+\][[:space:]]*)?//')
+  ck_set warn "近 24 小时 ${n} 条错误，最近一条：${last:0:60}" '执行 reality log 查看完整日志'
+}
+
+print_ck() { # print_ck <标签>
+  local mark color
+  case $CK_STATUS in
+    ok)   mark=$GL_PASS; color=$C_GREEN ;;
+    warn) mark=$GL_WARN; color=$C_YELLOW ;;
+    fail) mark=$GL_FAIL; color=$C_RED ;;
+    *)    mark=$GL_SKIP; color=$C_GRAY ;;
+  esac
+  printf '  %s%s%s %s  %s\n' "$color" "$mark" "$C_OFF" "$(pad_to "$1" 10)" "$CK_DETAIL"
+  if [[ -n $CK_HINT && $CK_STATUS != 'ok' ]]; then
+    printf '               %s→ %s%s\n' "$C_GRAY" "$CK_HINT" "$C_OFF"
+  fi
+  return 0
+}
+
+# 按链路从本机往外逐项检查。发现问题时退出码为 1，可直接用于定时监控
+cmd_check() {
+  require_installed
+  local item fails=0 warns=0
+  local -a items=(
+    'binary:Xray 内核'   'config:配置文件'   'service:服务状态'  'port:端口监听'
+    'firewall:本机防火墙' 'clock:系统时间'   'dns:DNS 解析'      'dest:伪装目标'
+    'host:分享地址'       'log:错误日志'
+  )
+  CK_BIN_OK=1; CK_DNS_OK=1
+  printf '\n'
+  rule_top '节点诊断'
+  for item in "${items[@]}"; do
+    ck_set skip ''
+    "ck_${item%%:*}"
+    print_ck "${item#*:}"
+    case $CK_STATUS in
+      fail) fails=$((fails + 1)) ;;
+      warn) warns=$((warns + 1)) ;;
+    esac
+  done
+  printf '\n  %s云服务器的安全组无法在本机检测：以上都正常却仍连不上时，请到控制台确认放行了 TCP %s。%s\n' \
+    "$C_GRAY" "$PORT" "$C_OFF"
+  rule_bottom
+  if ((fails > 0)); then
+    local extra=''
+    if ((warns > 0)); then extra="，另有 ${warns} 个提醒"; fi
+    printf '  %s发现 %d 个问题%s。按上面 → 的提示处理。%s\n\n' "$C_RED" "$fails" "$extra" "$C_OFF"
+  elif ((warns > 0)); then
+    printf '  %s没有发现问题，有 %d 个提醒。%s\n\n' "$C_YELLOW" "$warns" "$C_OFF"
+  else
+    printf '  %s全部正常。%s\n\n' "$C_GREEN" "$C_OFF"
+  fi
+  ((fails == 0))
+}
+
 #=============================== 菜单 =================================#
 
 item() { # item <编号> <文字>：左列，按显示宽度补齐
@@ -1517,6 +1895,8 @@ show_menu() {
   item 12 '服务启停 / 状态';   item_end 13 '查看实时日志'
   item 14 '更新 Xray-core';    item_end 15 "自动更新（$(autoupdate_state)）"
   item 16 '开启 BBR 加速';     item_end 17 '卸载' "$C_RED"
+  # 追加为 18 而不是插到前面：改动已有编号会让老用户按习惯输入时误触（比如误入卸载）
+  item_end 18 '节点诊断（连不上时先跑这个）'
 
   printf '\n'
   item_end 0 '退出'
@@ -1581,6 +1961,7 @@ menu_loop() {
       16) cmd_bbr         || error '操作失败。' ;;
       17) cmd_uninstall   || error '操作失败。'
           is_installed    || exit 0 ;;
+      18) cmd_check       || true ;;   # 非零只表示"发现了问题"，结果已在上面列出
       0)  exit 0 ;;
       *)  warn '无效选项。' ;;
     esac
@@ -1617,6 +1998,9 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
                           新版本起不来会自动回滚到上一版本
   selfupdate              更新管理脚本自身（仅手动）
   start | stop | restart | status | log
+  check                   一键诊断：逐项检查内核、配置、服务、端口、防火墙、
+                          DNS、伪装目标、分享地址与错误日志，并给出修复方法。
+                          发现问题时退出码为 1，可用于定时监控
   bbr                     开启 BBR 加速
   uninstall               卸载
   version                 显示版本
@@ -1693,6 +2077,7 @@ dispatch() {
     status)           cmd_status ;;
     log|logs)         cmd_log ;;
     bbr)              cmd_bbr ;;
+    check)            cmd_check ;;
     uninstall|remove) cmd_uninstall ;;
     version|-v|--version) printf '%s v%s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" ;;
     help)             usage ;;

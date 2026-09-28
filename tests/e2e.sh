@@ -36,7 +36,11 @@ for p in /usr/local/etc/xray /usr/local/bin/xray /usr/local/bin/reality /var/log
          /etc/systemd/system/reality-update.timer /etc/sysctl.d/99-reality-bbr.conf; do
   [[ -e $p ]] || CREATED+=("$p")
 done
-cleanup() { rm -rf "${CREATED[@]}" "$WORK"; }
+XRAY_PID=''
+cleanup() {
+  if [[ -n $XRAY_PID ]]; then kill "$XRAY_PID" 2>/dev/null; fi
+  rm -rf "${CREATED[@]}" "$WORK"
+}
 trap cleanup EXIT
 
 setup_xray
@@ -95,15 +99,27 @@ $NEW change-host '[2001:db8::2]' --yes >/dev/null 2>&1
 eq_ '带方括号粘贴的 IPv6 被规整' "$(host_of)" '2001:db8::2'
 $NEW change-host 1.2.3.4 --yes >/dev/null 2>&1
 
-group 'D. install 的 --host / --dest 校验'
-for bad in "a'b" 'a"b.com' '$(id)'; do
-  rm -rf /usr/local/etc/xray
-  if $NEW install --yes --host "$bad" >/dev/null 2>&1; then bad_ "install --host 接受了 [$bad]"; else ok_ "install --host 拒绝 [$bad]"; fi
-done
+group 'D. install 参数写错时立刻拒绝，且不先装内核'
+# 参数错误应在任何耗时操作之前报出。判据不靠计时：被拒绝后内核根本不该被装上
+reject_install() { # reject_install <说明> <install 的参数…>
+  local what=$1; shift
+  rm -rf /usr/local/etc/xray /usr/local/bin/xray
+  if $NEW install --yes "$@" >/dev/null 2>&1; then
+    bad_ "接受了错误参数：$what"
+  elif [[ -e /usr/local/bin/xray ]]; then
+    bad_ "拒绝了 $what，但已经先把内核装上了"
+  else
+    ok_ "立刻拒绝 $what，未安装内核"
+  fi
+}
+for bad in "a'b" 'a"b.com' '$(id)'; do reject_install "--host [$bad]" --host "$bad"; done
 for bad in "a'b.com:443" 'www.nvidia.com' 'a.com:99999'; do
-  rm -rf /usr/local/etc/xray
-  if $NEW install --yes --host 1.2.3.4 --dest "$bad" >/dev/null 2>&1; then bad_ "install --dest 接受了 [$bad]"; else ok_ "install --dest 拒绝 [$bad]"; fi
+  reject_install "--dest [$bad]" --host 1.2.3.4 --dest "$bad"
 done
+reject_install '--port 99999'      --host 1.2.3.4 --port 99999
+reject_install '--sni 无效域名'     --host 1.2.3.4 --sni 'not a domain'
+reject_install '--uuid 非法格式'    --host 1.2.3.4 --uuid not-a-uuid
+reject_install '--name 带引号'      --host 1.2.3.4 --name 'a"b'
 rm -rf /usr/local/etc/xray
 if $NEW install --yes --host 1.2.3.4 --dest www.nvidia.com:443 --sni www.nvidia.com >/dev/null 2>&1; then
   ok_ '合法 --dest 正常安装'
@@ -123,7 +139,40 @@ else
 fi
 cp "$WORK/meta.good" "$META"
 
-group 'F. 完整生命周期'
+group 'F. reality check 在真实安装上运行'
+# 只断言本机就能确定的四项。DNS、伪装目标、公网 IP 取决于所在网络，
+# 沙箱与 CI 的结果不同，交给单元测试用模拟覆盖
+# 容器里没有 systemd，手动把 Xray 跑起来，端口检查才有东西可查
+"$XRAY_DIR/xray" run -config "$CONF" >/dev/null 2>&1 &
+XRAY_PID=$!
+for _ in $(seq 40); do
+  ss -ltn | awk '{print $4}' | grep -q ':443$' && break
+  sleep 0.25
+done
+out=$($NEW check 2>&1)
+for l in 'Xray 内核' '配置文件' '服务状态' '端口监听'; do
+  if [[ $out == *"✓ $l"* ]]; then ok_ "✓ $l"; else bad_ "$l 不是 ✓：$(grep -F "$l" <<<"$out")"; fi
+done
+if [[ $out == *全部正常* || $out == *没有发现问题* || $out == *发现*个问题* ]]; then
+  ok_ '给出总结'
+else
+  bad_ "没有总结：$(tail -n3 <<<"$out")"
+fi
+kill "$XRAY_PID"; wait "$XRAY_PID" 2>/dev/null; XRAY_PID=''
+out=$($NEW check 2>&1); rc=$?
+if [[ $out == *"✗ 端口监听"* ]]; then ok_ 'Xray 退出后报告端口没人监听'; else bad_ "没发现端口问题：$(grep -F '端口监听' <<<"$out")"; fi
+eq_ '发现问题时退出码为 1（main 没有吞掉退出码）' "$rc" 1
+chmod 644 "$CONF"
+out=$($NEW check 2>&1)
+if [[ $out == *"! 配置文件"*644* ]]; then ok_ '配置权限放宽时提醒'; else bad_ "没有提醒权限：$(grep -F '配置文件' <<<"$out")"; fi
+chmod 600 "$CONF"
+msg=$($NEW check extra 2>&1)
+if [[ $msg == *不接受参数* ]]; then ok_ 'check 拒绝多余参数'; else bad_ "check 接受了多余参数：$msg"; fi
+# 菜单是交互路径，用伪终端驱动：选 18 → 回车返回菜单 → 0 退出
+out=$(printf '18\n\n0\n' | script -qec "$NEW" /dev/null 2>&1)
+if [[ $out == *节点诊断* && $out == *端口监听* ]]; then ok_ '菜单 18 运行诊断'; else bad_ "菜单 18 没有运行诊断：$(tail -n5 <<<"$out")"; fi
+
+group 'G. 完整生命周期'
 for c in 'change-port 8443' 'add-user 手机' 'rekey' 'change-sni www.microsoft.com' 'del-user 手机' 'change-port 443'; do
   # shellcheck disable=SC2086  # $c 需要按空格拆成命令与参数
   if $NEW $c --yes >/dev/null 2>&1; then ok_ "$c"; else bad_ "$c"; fi
