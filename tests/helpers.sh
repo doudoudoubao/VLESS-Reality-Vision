@@ -40,11 +40,13 @@ setup_xray() {
   printf '使用 %s\n' "$("$XRAY_DIR/xray" version | head -n1)"
 }
 
-# install.sh 的系统路径是 readonly，改写到临时目录后才能当库 source
+# install.sh 的系统路径是 readonly，改写到临时目录后才能当库 source。
+# 日志也要改：run -test 会初始化日志组件，非 root 写不了 /var/log
 make_lib() { # make_lib <源脚本> <输出>
-  mkdir -p "$WORK/etc/reality"
+  mkdir -p "$WORK/etc/reality" "$WORK/log"
   sed -e "s#^readonly XRAY_CONF_DIR=.*#readonly XRAY_CONF_DIR='$WORK/etc'#" \
       -e "s#^readonly DATA_DIR=.*#readonly DATA_DIR='$WORK/etc/reality'#" \
+      -e "s#^readonly XRAY_LOG=.*#readonly XRAY_LOG='$WORK/log/error.log'#" \
       -e "s#^readonly XRAY_BIN=.*#readonly XRAY_BIN='$XRAY_DIR/xray'#" "$1" >"$2"
 }
 
